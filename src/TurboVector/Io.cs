@@ -29,8 +29,17 @@ public static class Io
         int dim,
         int nVectors,
         ReadOnlySpan<byte> packedCodes,
+        ReadOnlySpan<float> scales)
+        => Write(path, bitWidth, dim, nVectors, packedCodes, scales, Durability.Durable);
+
+    public static void Write(
+        string path,
+        int bitWidth,
+        int dim,
+        int nVectors,
+        ReadOnlySpan<byte> packedCodes,
         ReadOnlySpan<float> scales,
-        Durability durability = Durability.Durable)
+        Durability durability)
         => PersistenceV8.WriteFile(path, 0, bitWidth, dim, nVectors, packedCodes, scales, default, default, default, durability);
 
     public static void Write(
@@ -67,8 +76,18 @@ public static class Io
         int nVectors,
         ReadOnlySpan<byte> packedCodes,
         ReadOnlySpan<float> scales,
+        ReadOnlySpan<ulong> slotToId)
+        => WriteIdMap(path, bitWidth, dim, nVectors, packedCodes, scales, slotToId, Durability.Durable);
+
+    public static void WriteIdMap(
+        string path,
+        int bitWidth,
+        int dim,
+        int nVectors,
+        ReadOnlySpan<byte> packedCodes,
+        ReadOnlySpan<float> scales,
         ReadOnlySpan<ulong> slotToId,
-        Durability durability = Durability.Durable)
+        Durability durability)
         => PersistenceV8.WriteFile(path, 1, bitWidth, dim, nVectors, packedCodes, scales, slotToId,
             default, default, durability);
 

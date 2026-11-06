@@ -200,7 +200,10 @@ public sealed class IdMapIndex
 
     public void Prepare() => _inner.Prepare();
 
-    public void Write(string path, Durability durability = Durability.Durable)
+    public void Write(string path)
+        => Write(path, Durability.Durable);
+
+    public void Write(string path, Durability durability)
         => _inner.WriteIdMapSnapshot(path, CollectionsMarshal.AsSpan(_slotToId), durability);
 
     /// <summary>Durably commits this index, appending complete units when possible.</summary>

@@ -1,5 +1,3 @@
-using TurboVector;
-
 namespace TurboVector.Tests;
 
 public class RotationParityTests

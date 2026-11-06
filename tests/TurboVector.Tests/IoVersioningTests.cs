@@ -1,5 +1,4 @@
 using System.Buffers.Binary;
-using TurboVector;
 
 namespace TurboVector.Tests;
 
@@ -184,6 +183,33 @@ public class IoVersioningTests
             Assert.Equal(64, reloaded.Len);
             Assert.Equal(loaded.PackedCodes.ToArray(), reloaded.PackedCodes.ToArray());
             Assert.Equal(loaded.Scales.ToArray(), reloaded.Scales.ToArray());
+        }
+        finally
+        {
+            TestHelpers.DeleteFileIfExists(path);
+        }
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void SyncCanAppendBeforeTheFirstFullBlock(int bitWidth)
+    {
+        const int dim = 64;
+        string path = TestHelpers.TempPath(".tv", $"sync-first-tail-{bitWidth}");
+        var index = new TurboQuantIndex(dim, bitWidth);
+        try
+        {
+            index.Add(TestHelpers.MakeVectors(1, dim, seed: 201 + (ulong)bitWidth));
+            index.Sync(path);
+            index.Add(TestHelpers.MakeVectors(1, dim, seed: 211 + (ulong)bitWidth));
+            index.Sync(path);
+
+            TurboQuantIndex loaded = TurboQuantIndex.Load(path);
+            Assert.Equal(2, loaded.Len);
+            Assert.Equal(index.PackedCodes.ToArray(), loaded.PackedCodes.ToArray());
+            Assert.Equal(index.Scales.ToArray(), loaded.Scales.ToArray());
         }
         finally
         {

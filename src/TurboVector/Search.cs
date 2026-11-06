@@ -1,8 +1,6 @@
 using System.Buffers;
 using System.Numerics;
 using System.Numerics.Tensors;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace TurboVector;
 
@@ -48,6 +46,23 @@ public static class Search
             _ => throw new NotSupportedException("Only 2-bit, 3-bit, and 4-bit search are supported."),
         };
     }
+
+    public static (float[] Scores, long[] Indices) Search_(
+        ReadOnlySpan<float> queries,
+        int nq,
+        ReadOnlySpan<float> rotation,
+        byte[] blockedCodes,
+        float[] centroids,
+        float[] vecScales,
+        int bitWidth,
+        int dim,
+        int nVectors,
+        int nBlocks,
+        int k,
+        ulong[]? mask,
+        int maskLength)
+        => Search_(queries, nq, rotation, blockedCodes, centroids, vecScales, bitWidth,
+            dim, nVectors, nBlocks, k, mask, maskLength, [], []);
 
     public static (float[] Scores, long[] Indices) Search_(
         ReadOnlySpan<float> queries,
@@ -173,6 +188,7 @@ public static class Search
         ReadOnlySpan<float> vecScalesSpan = vecScales.AsSpan(0, nVectors);
         ReadOnlySpan<ulong> maskSpan = mask is null ? ReadOnlySpan<ulong>.Empty : mask.AsSpan(0, maskLength);
         ValidateInputs(queries, nq, rotation, centroids, vecScalesSpan, bitWidth, dim, nVectors, k, maskSpan);
+        ValidateCalibration(dim, tqplusShift, tqplusScale);
 
         if (bitWidth == 3)
         {
@@ -199,7 +215,10 @@ public static class Search
             nBlocks,
             k,
             mask,
-            maskLength);
+            maskLength,
+            rotationPlan: null,
+            tqplusShift: tqplusShift,
+            tqplusScale: tqplusScale);
     }
 
     public static (float[] Scores, long[] Indices) Search3Bit_(

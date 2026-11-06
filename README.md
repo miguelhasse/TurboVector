@@ -17,7 +17,9 @@ Inner-product scores are corrected with a per-vector scale factor so that the se
 ```
 TurboVector.slnx
 ├── src/TurboVector/          # Class library — the core algorithm
-├── tests/TurboVector.Tests/  # xUnit.v3 unit & integration tests (84 tests)
+├── src/Extensions/VectorData/  # Microsoft.Extensions.VectorData TurboQuant provider
+├── tests/TurboVector.Tests/  # xUnit.v3 unit & integration tests
+├── tests/Hasseware.Extensions.VectorData.TurboQuant.Tests/  # VectorData provider tests
 ├── examples/TurboVector.Examples/  # Console app showing common usage patterns
 └── benchmarks/TurboVector.Benchmarks/  # BenchmarkDotNet performance measurements
 ```
@@ -34,6 +36,7 @@ dotnet build TurboVector.slnx
 
 # Run tests
 dotnet test tests/TurboVector.Tests
+dotnet test tests/Hasseware.Extensions.VectorData.TurboQuant.Tests
 
 # Run examples
 dotnet run --project examples/TurboVector.Examples
@@ -119,6 +122,7 @@ LUT score accumulation (`Score2/3/4Bit`) uses tightly-bounded scalar loops that 
 ## Project READMEs
 
 - [Library — `src/TurboVector`](src/TurboVector/README.md)
+- [VectorData provider — `src/Extensions/VectorData`](src/Extensions/VectorData/README.md)
 - [Tests — `tests/TurboVector.Tests`](tests/TurboVector.Tests/README.md)
 - [Examples — `examples/TurboVector.Examples`](examples/TurboVector.Examples/README.md)
 - [Benchmarks — `benchmarks/TurboVector.Benchmarks`](benchmarks/TurboVector.Benchmarks/README.md)

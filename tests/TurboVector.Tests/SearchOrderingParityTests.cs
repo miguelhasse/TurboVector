@@ -1,5 +1,3 @@
-using TurboVector;
-
 namespace TurboVector.Tests;
 
 public class SearchOrderingParityTests
@@ -70,5 +68,29 @@ public class SearchOrderingParityTests
         Assert.Equal([3L, 4L, 0L], results.Indices);
         Assert.True(results.Scores[0] > results.Scores[1]);
         Assert.True(results.Scores[1] > results.Scores[2]);
+    }
+
+    [Fact]
+    public void LowLevelSearchRetainsLegacyOverloadAndAppliesCalibration()
+    {
+        const int dim = 8;
+        const int bitWidth = 2;
+        float[] query = [1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f];
+        float[] rotation = Rotation.MakeRotationMatrix(dim);
+        float[] centroids = Codebook.Compute(bitWidth, dim).Centroids;
+        byte[] blockedCodes = new byte[dim / 4 * 32];
+        float[] vectorScales = [1.0f];
+
+        (float[] scores, long[] indices) = Search.Search_(
+            query, 1, rotation, blockedCodes, centroids, vectorScales,
+            bitWidth, dim, 1, 1, 1, null, 0);
+        (float[] calibratedScores, long[] calibratedIndices) = Search.Search_(
+            query, 1, rotation, blockedCodes, centroids, vectorScales,
+            bitWidth, dim, 1, 1, 1, null, 0,
+            Enumerable.Repeat(0.1f, dim).ToArray(),
+            Enumerable.Repeat(1.0f, dim).ToArray());
+
+        Assert.Equal(indices, calibratedIndices);
+        Assert.NotEqual(scores[0], calibratedScores[0]);
     }
 }

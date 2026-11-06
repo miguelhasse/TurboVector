@@ -439,7 +439,10 @@ public sealed class TurboQuantIndex
         _ = EnsureBlocked();
     }
 
-    public void Write(string path, Durability durability = Durability.Durable)
+    public void Write(string path)
+        => Write(path, Durability.Durable);
+
+    public void Write(string path, Durability durability)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         lock (_syncLock)
