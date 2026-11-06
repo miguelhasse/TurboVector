@@ -1,6 +1,8 @@
 # TurboVector.Tests
 
-xUnit.v3 unit and integration tests for the TurboVector core library. The VectorData provider tests are in the separate [`Hasseware.Extensions.VectorData.TurboQuant.Tests`](../Hasseware.Extensions.VectorData.TurboQuant.Tests) project.
+xUnit.v3 unit and integration tests for the TurboVector core library. The VectorData provider tests are in the separate [`Hasseware.Extensions.VectorData.TurboQuant.Tests`](../Hasseware.Extensions.VectorData.TurboQuant.Tests) project. They cover custom persistence, atomic failure and cancellation, collection naming and coordination, explicit JSON mappings, and legacy images.
+
+The [`TurboVector.NativeAot.Smoke`](../TurboVector.NativeAot.Smoke) executable checks both libraries with reflection-based JSON disabled. See the [publishing instructions](../../README.md#native-aot).
 
 ## Running Tests
 

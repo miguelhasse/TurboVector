@@ -1,5 +1,7 @@
 using Microsoft.Extensions.VectorData;
 using Microsoft.Extensions.VectorData.ProviderServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using TurboVector;
@@ -157,7 +159,7 @@ public sealed class TurboQuantVectorStoreTests : IDisposable
             ]
         };
 
-        Assert.ThrowsAny<Exception>(() => new InMemoryVectorStore().GetDynamicCollection("dynamic", definition));
+        Assert.Throws<NotSupportedException>(() => new InMemoryVectorStore().GetDynamicCollection("dynamic", definition));
 
         var options = new JsonSerializerOptions { TypeInfoResolver = TestJsonContext.Default };
         var store = new TurboQuantFileSystemVectorStore(_directory, serializerOptions: options);
@@ -212,6 +214,32 @@ public sealed class TurboQuantVectorStoreTests : IDisposable
         Assert.Contains("StorageName", error.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(7)]
+    [InlineData(16392)]
+    public void UnsupportedDimensionsAreRejectedWhenCreatingCollections(int dimension)
+    {
+        var mapping = new TurboQuantRecordMapping<string, Document>
+        {
+            Definition = new VectorStoreCollectionDefinition
+            {
+                Properties =
+                [
+                    new VectorStoreKeyProperty("Id", typeof(string)),
+                    new VectorStoreVectorProperty("Embedding", typeof(ReadOnlyMemory<float>), dimension)
+                ]
+            },
+            RecordTypeInfo = TestJsonContext.Default.Document,
+            KeyTypeInfo = TestJsonContext.Default.String,
+            GetKey = static document => document.Id,
+            GetVector = static document => document.Embedding
+        };
+
+        NotSupportedException error = Assert.Throws<NotSupportedException>(
+            () => new InMemoryVectorStore().GetCollection("documents", mapping));
+        Assert.Contains("dimensions", error.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task GeneratesGuidKeys()
     {
@@ -248,6 +276,66 @@ public sealed class TurboQuantVectorStoreTests : IDisposable
         await store.EnsureCollectionDeletedAsync("documents", cancellationToken);
         Assert.Empty(store.Images);
         Assert.False(await collection.CollectionExistsAsync(cancellationToken));
+    }
+
+    [Fact]
+    public async Task CancellationBeforeBackendCommitPreservesTheExistingImage()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var store = new InMemoryVectorStore();
+        TurboQuantCollection<string, Document> collection = store.GetCollection("documents", TestMappings.Document);
+        await collection.UpsertAsync(new Document("a", "original", 1, Axis0), cancellationToken);
+        byte[] committed = store.Images["documents"].ToArray();
+
+        store.BeforeCommit = cancellation.Cancel;
+        OperationCanceledException error = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => collection.UpsertAsync(new Document("b", "cancelled", 2, Axis1), cancellation.Token));
+        store.BeforeCommit = null;
+
+        Assert.Equal(cancellation.Token, error.CancellationToken);
+        Assert.Equal(committed, store.Images["documents"]);
+        Assert.Equal("original", (await collection.GetAsync("a", cancellationToken: cancellationToken))?.Category);
+        Assert.Null(await collection.GetAsync("b", cancellationToken: cancellationToken));
+    }
+
+    [Fact]
+    public async Task CancelledFileWritesPreserveTheCommittedImage()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var store = new TurboQuantFileSystemVectorStore(_directory);
+        TurboQuantCollection<string, Document> collection = store.GetCollection("documents", TestMappings.Document);
+        await collection.UpsertAsync(new Document("a", "original", 1, Axis0), cancellationToken);
+        string imagePath = Assert.Single(Directory.GetFiles(_directory, "*.tqv"));
+        byte[] committed = await File.ReadAllBytesAsync(imagePath, cancellationToken);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => collection.UpsertAsync(new Document("b", "cancelled", 2, Axis1), cancellation.Token));
+
+        Assert.Equal(committed, await File.ReadAllBytesAsync(imagePath, cancellationToken));
+        Assert.Empty(Directory.GetFiles(_directory, "*.tmp"));
+        Assert.Null(await collection.GetAsync("b", cancellationToken: cancellationToken));
+    }
+
+    [Fact]
+    public async Task FileStoreHashesArbitraryNamesAndListsThemOrdinally()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        string[] names = ["../outside", "Alpha", "alpha", "docs/nested", "n\u00e4me"];
+        var store = new TurboQuantFileSystemVectorStore(_directory);
+        foreach (string name in names)
+        {
+            await store.GetCollection(name, TestMappings.Document).EnsureCollectionExistsAsync(cancellationToken);
+        }
+
+        Assert.Equal(names.Order(StringComparer.Ordinal), await ToListAsync(store.ListCollectionNamesAsync(cancellationToken)));
+        IEnumerable<string> expectedFiles = names
+            .Select(name => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(name))) + ".tqv")
+            .Order(StringComparer.Ordinal);
+        IEnumerable<string?> actualFiles = Directory.GetFiles(_directory).Select(Path.GetFileName).Order(StringComparer.Ordinal);
+        Assert.Equal(expectedFiles, actualFiles);
     }
 
     [Fact]
@@ -315,15 +403,56 @@ public sealed class TurboQuantVectorStoreTests : IDisposable
         Assert.Equal(4UL, rewritten["NextId"]!.GetValue<ulong>());
     }
 
+    [Fact]
+    public async Task ReadsEarlierImagesWrittenWithAJsonNamingPolicy()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var legacyOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+        var context = new TestJsonContext(new JsonSerializerOptions(legacyOptions));
+        var mapping = new TurboQuantRecordMapping<string, Document>
+        {
+            Definition = TestMappings.Document.Definition,
+            RecordTypeInfo = context.Document,
+            KeyTypeInfo = context.String,
+            GetKey = static document => document.Id,
+            GetVector = static document => document.Embedding
+        };
+        var document = new Document("legacy-id", "original", 1, Axis0);
+        IdMapIndex index = IdMapIndex.NewLazy(4);
+        index.AddWithIds2D(Axis0, 8, [1UL]);
+        var legacyImage = new JsonObject
+        {
+            ["Name"] = "legacy-camel",
+            ["Schema"] = LegacyFingerprint(typeof(Document), typeof(string), legacyOptions),
+            ["Index"] = Convert.ToBase64String(index.ToBytes()),
+            ["KeyToId"] = new JsonObject { [JsonSerializer.Serialize(document.Id, legacyOptions)] = 1 },
+            ["Records"] = new JsonObject { ["1"] = JsonSerializer.Serialize(document, legacyOptions) },
+            ["NextId"] = 2
+        };
+        var store = new InMemoryVectorStore();
+        store.Images["legacy-camel"] = JsonSerializer.SerializeToUtf8Bytes<JsonNode>(legacyImage);
+
+        TurboQuantCollection<string, Document> collection = store.GetCollection("legacy-camel", mapping);
+        Document? restored = await collection.GetAsync(
+            "legacy-id", new RecordRetrievalOptions { IncludeVectors = true }, cancellationToken);
+        Assert.NotNull(restored);
+        Assert.Equal("original", restored.Category);
+        Assert.Equal(Axis0, restored.Embedding.ToArray());
+
+        await collection.UpsertAsync(new Document("next", "new", 2, Axis1), cancellationToken);
+        Assert.Equal("original", (await collection.GetAsync("legacy-id", cancellationToken: cancellationToken))?.Category);
+    }
+
     private static string StoredSchema(InMemoryVectorStore store, string name)
         => JsonNode.Parse(store.Images[name])!["Schema"]!.GetValue<string>();
 
     // Reproduces the fingerprint written by the reflection-based provider releases.
-    private static string LegacyFingerprint(Type recordType, Type keyType)
+    private static string LegacyFingerprint(Type recordType, Type keyType, JsonSerializerOptions? options = null)
     {
 #pragma warning disable IL2026, IL3050
         CollectionModel model = new LegacyModelBuilder().Build(
-            recordType, keyType, definition: null, defaultEmbeddingGenerator: null, new JsonSerializerOptions(JsonSerializerDefaults.General));
+            recordType, keyType, definition: null, defaultEmbeddingGenerator: null,
+            options ?? new JsonSerializerOptions(JsonSerializerDefaults.General));
 #pragma warning restore IL2026, IL3050
         var entries = new List<string>();
         foreach (PropertyModel property in model.Properties)

@@ -8,6 +8,8 @@ The core algorithm library. Targets **net10.0**, enables unsafe code (bit-packin
 
 Rotation, codebook construction, calibration, encoding, packing, and search are implemented in the library without external math packages.
 
+The core library supports trimming and Native AOT. The [Native AOT smoke test](../../README.md#native-aot) validates calibrated quantization and persistence alongside the VectorData provider.
+
 ---
 
 ## Public API

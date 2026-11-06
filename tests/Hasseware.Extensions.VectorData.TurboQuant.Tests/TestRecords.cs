@@ -110,6 +110,8 @@ internal sealed class InMemoryVectorStore(int bitWidth = 4) : TurboQuantVectorSt
 
     public bool FailWrites { get; set; }
 
+    public Action? BeforeCommit { get; set; }
+
     protected override ValueTask<Stream?> OpenCollectionReadStreamAsync(string name, CancellationToken cancellationToken)
         => ValueTask.FromResult<Stream?>(Images.TryGetValue(name, out byte[]? image) ? new MemoryStream(image, writable: false) : null);
 
@@ -125,6 +127,8 @@ internal sealed class InMemoryVectorStore(int bitWidth = 4) : TurboQuantVectorSt
             throw new IOException("Simulated write failure.");
         }
 
+        BeforeCommit?.Invoke();
+        cancellationToken.ThrowIfCancellationRequested();
         Images[name] = buffer.ToArray();
     }
 

@@ -4,5 +4,6 @@
   <Project Path="src/TurboVector/TurboVector.csproj" />
   <Project Path="src/Extensions/VectorData/Hasseware.Extensions.VectorData.TurboQuant.csproj" />
   <Project Path="tests/Hasseware.Extensions.VectorData.TurboQuant.Tests/Hasseware.Extensions.VectorData.TurboQuant.Tests.csproj" />
+  <Project Path="tests/TurboVector.NativeAot.Smoke/TurboVector.NativeAot.Smoke.csproj" />
   <Project Path="tests/TurboVector.Tests/TurboVector.Tests.csproj" />
 </Solution>

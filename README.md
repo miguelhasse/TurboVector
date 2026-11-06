@@ -20,6 +20,7 @@ TurboVector.slnx
 ├── src/Extensions/VectorData/  # Microsoft.Extensions.VectorData TurboQuant provider
 ├── tests/TurboVector.Tests/  # xUnit.v3 unit & integration tests
 ├── tests/Hasseware.Extensions.VectorData.TurboQuant.Tests/  # VectorData provider tests
+├── tests/TurboVector.NativeAot.Smoke/  # Native AOT executable for both libraries
 ├── examples/TurboVector.Examples/  # Console app showing common usage patterns
 └── benchmarks/TurboVector.Benchmarks/  # BenchmarkDotNet performance measurements
 ```
@@ -27,6 +28,7 @@ TurboVector.slnx
 ## Requirements
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
+- Native AOT publishing also requires the native toolchain for the target runtime.
 
 ## Quick Start
 
@@ -44,6 +46,19 @@ dotnet run --project examples/TurboVector.Examples
 # Run benchmarks (Release mode required)
 dotnet run --project benchmarks/TurboVector.Benchmarks -c Release -- --filter "*Search*"
 ```
+
+## Native AOT
+
+The core library and VectorData provider support Native AOT and trimming. Typed VectorData collections require explicit, source-generated JSON metadata and accessors; see the [provider guide](src/Extensions/VectorData/README.md).
+
+To publish and run the smoke test on Windows x64, from the solution root:
+
+```powershell
+dotnet publish tests\TurboVector.NativeAot.Smoke -c Release -r win-x64
+.\tests\TurboVector.NativeAot.Smoke\bin\Release\net10.0\win-x64\publish\TurboVector.NativeAot.Smoke.exe
+```
+
+For other platforms, use the appropriate runtime identifier and executable path. The smoke test disables reflection-based JSON serialization and checks calibrated Rust fixture parity, persistence, search, and typed and dynamic provider operations.
 
 ## Usage at a Glance
 
