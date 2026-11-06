@@ -1,73 +1,126 @@
 using Microsoft.Extensions.VectorData;
-using Microsoft.Extensions.VectorData.ProviderServices;
 using System.Collections.Concurrent;
-using System.Security.Cryptography;
-using System.Text;
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 
 namespace Hasseware.Extensions.VectorData.TurboQuant;
 
-public sealed class TurboQuantVectorStore : VectorStore
+/// <summary>
+/// Base class for TurboQuant-backed vector stores. Derived classes supply the persistence of
+/// collection images (for example file system, blob storage, or database rows); the base class
+/// implements collection management, quantized indexing, record mapping, and search.
+/// </summary>
+/// <remarks>
+/// Each collection is persisted as a single self-describing image keyed by its collection name.
+/// Implementations must replace images atomically, so readers observe either the previous or the
+/// new committed image, and must return <see langword="null"/> from
+/// <see cref="OpenCollectionReadStreamAsync"/> for collections that do not exist.
+/// </remarks>
+public abstract class TurboQuantVectorStore : VectorStore
 {
-    private readonly string _directoryPath;
-    private readonly int _bitWidth;
-    private readonly JsonSerializerOptions _serializerOptions;
-    internal static readonly ConcurrentDictionary<string, SemaphoreSlim> CollectionLocks = new(
-        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+    private const string TypedCollectionAotMessage =
+        "VectorStore.GetCollection<TKey, TRecord> is annotated as requiring dynamic code. Use GetCollection(name, TurboQuantRecordMapping<TKey, TRecord>) for trimmed and Native AOT applications.";
 
-    public TurboQuantVectorStore(string directoryPath, int bitWidth = 4, JsonSerializerOptions? serializerOptions = null)
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<(Type Key, Type Record), object> _mappings = new();
+
+    /// <summary>Initializes the store.</summary>
+    /// <param name="bitWidth">TurboQuant bit width used for new collections: 2, 3, or 4.</param>
+    /// <param name="serializerOptions">
+    /// Options for dynamic collections. Additional data types must be resolvable through
+    /// <see cref="JsonSerializerOptions.TypeInfoResolver"/>; common scalar and vector types are built in.
+    /// </param>
+    protected TurboQuantVectorStore(int bitWidth = 4, JsonSerializerOptions? serializerOptions = null)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(directoryPath);
         if (bitWidth is not (2 or 3 or 4))
         {
             throw new ArgumentOutOfRangeException(nameof(bitWidth), "TurboQuant bit width must be 2, 3, or 4.");
         }
 
-        _directoryPath = Path.GetFullPath(directoryPath);
-        _bitWidth = bitWidth;
-        _serializerOptions = serializerOptions is null
+        BitWidth = bitWidth;
+        var options = serializerOptions is null
             ? new JsonSerializerOptions(JsonSerializerDefaults.General)
             : new JsonSerializerOptions(serializerOptions);
+        options.TypeInfoResolver = options.TypeInfoResolver is null
+            ? TurboQuantDynamicJsonContext.Default
+            : JsonTypeInfoResolver.Combine(options.TypeInfoResolver, TurboQuantDynamicJsonContext.Default);
+        options.MakeReadOnly();
+        SerializerOptions = options;
     }
 
+    /// <summary>Gets the TurboQuant bit width used for new collections.</summary>
+    public int BitWidth { get; }
+
+    internal JsonSerializerOptions SerializerOptions { get; }
+
+    /// <summary>
+    /// Registers the explicit, trimming-safe mapping used by
+    /// <see cref="GetCollection{TKey, TRecord}(string, VectorStoreCollectionDefinition?)"/> for a key/record type pair.
+    /// </summary>
+    /// <returns>This store, for chaining.</returns>
+    public TurboQuantVectorStore RegisterRecordMapping<TKey, TRecord>(TurboQuantRecordMapping<TKey, TRecord> mapping)
+        where TKey : notnull
+        where TRecord : class
+    {
+        ArgumentNullException.ThrowIfNull(mapping);
+        _ = new TypedRecordAccessor<TKey, TRecord>(mapping, definition: null);
+        _mappings[(typeof(TKey), typeof(TRecord))] = mapping;
+        return this;
+    }
+
+    /// <summary>Gets a typed collection using an explicit, trimming- and Native AOT-safe record mapping.</summary>
+    public TurboQuantCollection<TKey, TRecord> GetCollection<TKey, TRecord>(string name, TurboQuantRecordMapping<TKey, TRecord> mapping)
+        where TKey : notnull
+        where TRecord : class
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentNullException.ThrowIfNull(mapping);
+        return new TurboQuantCollection<TKey, TRecord>(this, name, new TypedRecordAccessor<TKey, TRecord>(mapping, definition: null));
+    }
+
+    /// <summary>
+    /// Gets a typed collection using the mapping registered with
+    /// <see cref="RegisterRecordMapping{TKey, TRecord}"/>. A supplied <paramref name="definition"/>
+    /// replaces the registered mapping's definition.
+    /// </summary>
+    [RequiresDynamicCode(TypedCollectionAotMessage)]
+    [RequiresUnreferencedCode(TypedCollectionAotMessage)]
     public override VectorStoreCollection<TKey, TRecord> GetCollection<TKey, TRecord>(
         string name,
         VectorStoreCollectionDefinition? definition = null)
-        => new TurboQuantCollection<TKey, TRecord>(
-            name, CollectionPath(name), _bitWidth, definition, _serializerOptions, CollectionLocks);
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        if (!_mappings.TryGetValue((typeof(TKey), typeof(TRecord)), out object? registered))
+        {
+            throw new InvalidOperationException(
+                $"No TurboQuant record mapping is registered for key type '{typeof(TKey)}' and record type '{typeof(TRecord)}'. " +
+                "Call RegisterRecordMapping or use GetCollection(name, mapping).");
+        }
 
+        var mapping = (TurboQuantRecordMapping<TKey, TRecord>)registered;
+        return new TurboQuantCollection<TKey, TRecord>(this, name, new TypedRecordAccessor<TKey, TRecord>(mapping, definition));
+    }
+
+    /// <inheritdoc />
     public override VectorStoreCollection<object, Dictionary<string, object?>> GetDynamicCollection(
         string name,
         VectorStoreCollectionDefinition definition)
-        => new TurboQuantCollection<object, Dictionary<string, object?>>(
-            name, CollectionPath(name), _bitWidth, definition, _serializerOptions, CollectionLocks, dynamic: true);
-
-    public override async IAsyncEnumerable<string> ListCollectionNamesAsync(
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        if (!Directory.Exists(_directoryPath))
-        {
-            yield break;
-        }
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentNullException.ThrowIfNull(definition);
+        return new TurboQuantCollection<object, Dictionary<string, object?>>(this, name, new DynamicRecordAccessor(definition, SerializerOptions));
+    }
 
+    /// <inheritdoc />
+    public override async IAsyncEnumerable<string> ListCollectionNamesAsync(
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
         var names = new List<string>();
-        foreach (string path in Directory.EnumerateFiles(_directoryPath, "*.tqv"))
+        await foreach (string name in ListStoredCollectionNamesAsync(cancellationToken).ConfigureAwait(false))
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            SemaphoreSlim gate = CollectionLocks.GetOrAdd(path, static _ => new SemaphoreSlim(1, 1));
-            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
-            {
-                if (File.Exists(path))
-                {
-                    CollectionImage image = await CollectionStorage.ReadImageAsync(path, cancellationToken).ConfigureAwait(false);
-                    names.Add(image.Name);
-                }
-            }
-            finally
-            {
-                gate.Release();
-            }
+            names.Add(name);
         }
 
         names.Sort(StringComparer.Ordinal);
@@ -78,25 +131,15 @@ public sealed class TurboQuantVectorStore : VectorStore
         }
     }
 
+    /// <inheritdoc />
     public override async Task<bool> CollectionExistsAsync(string name, CancellationToken cancellationToken = default)
     {
-        string path = CollectionPath(name);
-        if (!File.Exists(path))
-        {
-            return false;
-        }
-
-        SemaphoreSlim gate = CollectionLocks.GetOrAdd(path, static _ => new SemaphoreSlim(1, 1));
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        SemaphoreSlim gate = GetCollectionLock(name);
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (!File.Exists(path))
-            {
-                return false;
-            }
-
-            CollectionImage image = await CollectionStorage.ReadImageAsync(path, cancellationToken).ConfigureAwait(false);
-            return string.Equals(image.Name, name, StringComparison.Ordinal);
+            return await ImageExistsAsync(name, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -104,15 +147,16 @@ public sealed class TurboQuantVectorStore : VectorStore
         }
     }
 
+    /// <inheritdoc />
     public override async Task EnsureCollectionDeletedAsync(string name, CancellationToken cancellationToken = default)
     {
-        string path = CollectionPath(name);
-        SemaphoreSlim gate = CollectionLocks.GetOrAdd(path, static _ => new SemaphoreSlim(1, 1));
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        SemaphoreSlim gate = GetCollectionLock(name);
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            File.Delete(path);
+            await DeleteCollectionAsync(name, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -120,94 +164,93 @@ public sealed class TurboQuantVectorStore : VectorStore
         }
     }
 
+    /// <inheritdoc />
     public override object? GetService(Type serviceType, object? serviceKey = null)
     {
         ArgumentNullException.ThrowIfNull(serviceType);
         return serviceType.IsInstanceOfType(this) ? this : null;
     }
 
-    private string CollectionPath(string name)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(name);
-        byte[] nameBytes = Encoding.UTF8.GetBytes(name);
-        return Path.Combine(_directoryPath, Convert.ToHexString(SHA256.HashData(nameBytes)) + ".tqv");
-    }
-}
+    /// <summary>
+    /// Opens a readable stream over the committed image of a collection, or returns
+    /// <see langword="null"/> when no image exists. The caller disposes the stream.
+    /// </summary>
+    protected abstract ValueTask<Stream?> OpenCollectionReadStreamAsync(string name, CancellationToken cancellationToken);
 
-internal sealed class TurboQuantModelBuilder : CollectionJsonModelBuilder
-{
-    public TurboQuantModelBuilder()
-        : base(new CollectionModelBuildingOptions
+    /// <summary>
+    /// Writes and atomically commits a collection image. Implementations invoke
+    /// <paramref name="writeImage"/> exactly once with a writable stream, and must commit the
+    /// written bytes only when it completes successfully, preserving the previous image otherwise.
+    /// </summary>
+    protected abstract ValueTask WriteCollectionAsync(
+        string name,
+        Func<Stream, CancellationToken, ValueTask> writeImage,
+        CancellationToken cancellationToken);
+
+    /// <summary>Deletes the image of a collection. Deleting a missing collection is not an error.</summary>
+    protected abstract ValueTask DeleteCollectionAsync(string name, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Enumerates the names of persisted collections in any order. Implementations without a name
+    /// index can use <see cref="ReadCollectionNameAsync"/> to read the name from an image.
+    /// </summary>
+    protected abstract IAsyncEnumerable<string> ListStoredCollectionNamesAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Gets the lock serializing operations on a collection. The default implementation coordinates
+    /// operations within this store instance; override to share coordination across instances.
+    /// It does not provide cross-process or distributed coordination.
+    /// </summary>
+    protected virtual SemaphoreSlim GetCollectionLock(string name)
+        => _locks.GetOrAdd(name, static _ => new SemaphoreSlim(1, 1));
+
+    /// <summary>Reads the collection name recorded in a collection image.</summary>
+    protected static async ValueTask<string> ReadCollectionNameAsync(Stream image, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(image);
+        CollectionImageHeader? header = await JsonSerializer.DeserializeAsync(
+            image, CollectionImageJsonContext.Default.CollectionImageHeader, cancellationToken).ConfigureAwait(false);
+        return header?.Name ?? throw new InvalidDataException("The collection image does not contain a collection name.");
+    }
+
+    internal SemaphoreSlim GetLock(string name) => GetCollectionLock(name);
+
+    internal async ValueTask<bool> ImageExistsAsync(string name, CancellationToken cancellationToken)
+    {
+        Stream? stream = await OpenCollectionReadStreamAsync(name, cancellationToken).ConfigureAwait(false);
+        if (stream is null)
         {
-            SupportsMultipleVectors = false,
-            RequiresAtLeastOneVector = true,
-            UsesExternalSerializer = true
-        })
-    {
-    }
-
-    protected override void Customize()
-    {
-    }
-
-    protected override bool IsDataPropertyTypeValid(Type type, out string errorMessage)
-    {
-        errorMessage = type.IsPointer || type.IsByRef
-            ? $"Data property type '{type}' cannot be serialized."
-            : string.Empty;
-        return errorMessage.Length == 0;
-    }
-
-    protected override bool IsVectorPropertyTypeValid(Type type, out string errorMessage)
-    {
-        bool supported = type == typeof(float[]) ||
-            type == typeof(Memory<float>) ||
-            type == typeof(ReadOnlyMemory<float>) ||
-            typeof(IEnumerable<float>).IsAssignableFrom(type);
-        errorMessage = supported ? string.Empty : $"Vector property type '{type}' must be a float array, memory, or float sequence.";
-        return supported;
-    }
-}
-
-internal sealed class CollectionImage
-{
-    public required string Name { get; init; }
-    public required string Schema { get; init; }
-    public required byte[] Index { get; init; }
-    public required Dictionary<string, ulong> KeyToId { get; init; }
-    public required Dictionary<string, string> Records { get; init; }
-    public ulong NextId { get; init; }
-}
-
-internal static class CollectionStorage
-{
-    public static async Task<CollectionImage> ReadImageAsync(string path, CancellationToken cancellationToken)
-    {
-        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        return await JsonSerializer.DeserializeAsync<CollectionImage>(stream, cancellationToken: cancellationToken).ConfigureAwait(false)
-            ?? throw new InvalidDataException($"Collection image '{path}' is empty or invalid.");
-    }
-
-    public static async Task WriteImageAsync(string path, CollectionImage image, CancellationToken cancellationToken)
-    {
-        string directory = Path.GetDirectoryName(path)!;
-        Directory.CreateDirectory(directory);
-        string temporaryPath = Path.Combine(directory, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
-        try
-        {
-            await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
-            {
-                await JsonSerializer.SerializeAsync(stream, image, cancellationToken: cancellationToken).ConfigureAwait(false);
-                await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-                stream.Flush(flushToDisk: true);
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-            File.Move(temporaryPath, path, overwrite: true);
+            return false;
         }
-        finally
+
+        await using (stream.ConfigureAwait(false))
         {
-            File.Delete(temporaryPath);
+            string storedName = await ReadCollectionNameAsync(stream, cancellationToken).ConfigureAwait(false);
+            return string.Equals(storedName, name, StringComparison.Ordinal);
         }
     }
+
+    internal async ValueTask<CollectionImage?> ReadImageAsync(string name, CancellationToken cancellationToken)
+    {
+        Stream? stream = await OpenCollectionReadStreamAsync(name, cancellationToken).ConfigureAwait(false);
+        if (stream is null)
+        {
+            return null;
+        }
+
+        await using (stream.ConfigureAwait(false))
+        {
+            return await JsonSerializer.DeserializeAsync(stream, CollectionImageJsonContext.Default.CollectionImage, cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidDataException($"The image of collection '{name}' is empty or invalid.");
+        }
+    }
+
+    internal ValueTask WriteImageAsync(CollectionImage image, CancellationToken cancellationToken)
+        => WriteCollectionAsync(
+            image.Name,
+            (stream, token) => new ValueTask(JsonSerializer.SerializeAsync(stream, image, CollectionImageJsonContext.Default.CollectionImage, token)),
+            cancellationToken);
+
+    internal ValueTask DeleteImageAsync(string name, CancellationToken cancellationToken)
+        => DeleteCollectionAsync(name, cancellationToken);
 }

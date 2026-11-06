@@ -2,76 +2,40 @@ using Microsoft.Extensions.VectorData;
 using Microsoft.Extensions.VectorData.ProviderServices;
 using System.Globalization;
 using System.Linq.Expressions;
-using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
-using System.Text.Json;
-using System.Text.Json.Nodes;
-using System.Text.Json.Serialization;
 using TurboVector;
 
 namespace Hasseware.Extensions.VectorData.TurboQuant;
 
+/// <summary>A TurboQuant collection persisted through a <see cref="TurboQuantVectorStore"/>.</summary>
 public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<TKey, TRecord>
     where TKey : notnull
     where TRecord : class
 {
-    private readonly string _path;
-    private readonly int _bitWidth;
-    private readonly JsonSerializerOptions _serializerOptions;
-    private readonly CollectionModel _model;
-    private readonly string _schema;
-    private readonly string _distanceFunction;
+    private readonly TurboQuantVectorStore _store;
+    private readonly RecordAccessor<TKey, TRecord> _accessor;
+    private readonly CollectionSchema _schema;
     private readonly SemaphoreSlim _gate;
 
-    internal TurboQuantCollection(
-        string name,
-        string path,
-        int bitWidth,
-        VectorStoreCollectionDefinition? definition,
-        JsonSerializerOptions serializerOptions,
-        System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> locks,
-        bool dynamic = false)
-        : base()
+    internal TurboQuantCollection(TurboQuantVectorStore store, string name, RecordAccessor<TKey, TRecord> accessor)
     {
-        _path = path;
-        _bitWidth = bitWidth;
-        _serializerOptions = serializerOptions;
+        _store = store;
+        _accessor = accessor;
+        _schema = accessor.Schema;
         Name = name;
-        _gate = locks.GetOrAdd(path, static _ => new SemaphoreSlim(1, 1));
-        var builder = new TurboQuantModelBuilder();
-        _model = dynamic
-            ? builder.BuildDynamic(definition ?? throw new ArgumentNullException(nameof(definition)), defaultEmbeddingGenerator: null, serializerOptions)
-            : builder.Build(typeof(TRecord), typeof(TKey), definition, defaultEmbeddingGenerator: null, serializerOptions);
-        _distanceFunction = _model.VectorProperty.DistanceFunction ?? DistanceFunction.DotProductSimilarity;
-        if (_model.VectorProperty.EmbeddingGenerator is not null)
-        {
-            throw new NotSupportedException("TurboQuant stores precomputed vectors and does not support embedding generators.");
-        }
-
-        if (_model.VectorProperty.IndexKind is not null and not IndexKind.QuantizedFlat)
-        {
-            throw new NotSupportedException($"TurboQuant does not support the index kind '{_model.VectorProperty.IndexKind}'.");
-        }
-
-        if (_distanceFunction is not (DistanceFunction.DotProductSimilarity or
-            DistanceFunction.NegativeDotProductSimilarity or
-            DistanceFunction.CosineSimilarity or
-            DistanceFunction.CosineDistance))
-        {
-            throw new NotSupportedException($"TurboQuant does not support the distance function '{_distanceFunction}'.");
-        }
-
-        _schema = CreateSchemaFingerprint(_model);
+        _gate = store.GetLock(name);
     }
 
+    /// <inheritdoc />
     public override string Name { get; }
 
+    /// <inheritdoc />
     public override async Task<bool> CollectionExistsAsync(CancellationToken cancellationToken = default)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return File.Exists(_path);
+            return await _store.ImageExistsAsync(Name, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -79,19 +43,15 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
         }
     }
 
+    /// <inheritdoc />
     public override async Task EnsureCollectionExistsAsync(CancellationToken cancellationToken = default)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (!File.Exists(_path))
+            if (await LoadIfExistsAsync(cancellationToken).ConfigureAwait(false) is null)
             {
-                State state = NewState();
-                await SaveAsync(state, cancellationToken).ConfigureAwait(false);
-            }
-            else
-            {
-                _ = await LoadAsync(cancellationToken).ConfigureAwait(false);
+                await SaveAsync(NewState(), cancellationToken).ConfigureAwait(false);
             }
         }
         finally
@@ -100,13 +60,14 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
         }
     }
 
+    /// <inheritdoc />
     public override async Task EnsureCollectionDeletedAsync(CancellationToken cancellationToken = default)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            File.Delete(_path);
+            await _store.DeleteImageAsync(Name, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -114,24 +75,25 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
         }
     }
 
+    /// <inheritdoc />
     public override async Task<TRecord?> GetAsync(
         TKey key,
         RecordRetrievalOptions? options = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(key);
+        string keyJson = _accessor.SerializeKey(key);
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             State? state = await LoadIfExistsAsync(cancellationToken).ConfigureAwait(false);
-            if (state is null || !state.KeyToId.TryGetValue(SerializeKey(key), out ulong id) ||
+            if (state is null || !state.KeyToId.TryGetValue(keyJson, out ulong id) ||
                 !state.Records.TryGetValue(IdKey(id), out string? json))
             {
                 return default;
             }
 
-            TRecord record = DeserializeRecord(json);
-            return options?.IncludeVectors == true ? record : WithoutVectors(record);
+            return _accessor.Deserialize(json, options?.IncludeVectors == true);
         }
         finally
         {
@@ -139,6 +101,7 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
         }
     }
 
+    /// <inheritdoc />
     public override async IAsyncEnumerable<TRecord> GetAsync(
         Expression<Func<TRecord, bool>> filter,
         int top,
@@ -154,6 +117,8 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
 
         int requestedSkip = options?.Skip ?? 0;
         ArgumentOutOfRangeException.ThrowIfNegative(requestedSkip);
+        bool includeVectors = options?.IncludeVectors == true;
+        Func<TRecord, bool> predicate = filter.Compile();
         List<TRecord> result = [];
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -164,17 +129,14 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
                 yield break;
             }
 
-            Func<TRecord, bool> predicate = filter.Compile();
             foreach (string json in state.Records.Values)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                TRecord record = DeserializeRecord(json);
-                if (!predicate(record))
+                TRecord record = _accessor.Deserialize(json, includeVectors: true);
+                if (predicate(record))
                 {
-                    continue;
+                    result.Add(includeVectors ? record : _accessor.Deserialize(json, includeVectors: false));
                 }
-
-                result.Add(options?.IncludeVectors == true ? record : WithoutVectors(record));
             }
         }
         finally
@@ -190,20 +152,16 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
         }
     }
 
+    /// <inheritdoc />
     public override async Task DeleteAsync(TKey key, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(key);
+        string keyJson = _accessor.SerializeKey(key);
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             State? state = await LoadIfExistsAsync(cancellationToken).ConfigureAwait(false);
-            if (state is null)
-            {
-                return;
-            }
-
-            string keyJson = SerializeKey(key);
-            if (!state.KeyToId.Remove(keyJson, out ulong id))
+            if (state is null || !state.KeyToId.Remove(keyJson, out ulong id))
             {
                 return;
             }
@@ -218,12 +176,14 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
         }
     }
 
-    public override async Task UpsertAsync(TRecord record, CancellationToken cancellationToken = default)
+    /// <inheritdoc />
+    public override Task UpsertAsync(TRecord record, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(record);
-        await UpsertAsync([record], cancellationToken).ConfigureAwait(false);
+        return UpsertAsync([record], cancellationToken);
     }
 
+    /// <inheritdoc />
     public override async Task UpsertAsync(IEnumerable<TRecord> records, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(records);
@@ -233,32 +193,24 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
             return;
         }
 
-        float[][] vectors = new float[batch.Length][];
+        VectorPropertyModel vectorProperty = _schema.VectorProperty;
+        var vectors = new ReadOnlyMemory<float>[batch.Length];
         string[] keyJsons = new string[batch.Length];
         string[] recordJsons = new string[batch.Length];
-        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+        var seenKeys = new HashSet<string>(batch.Length, StringComparer.Ordinal);
         for (int i = 0; i < batch.Length; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             TRecord record = batch[i] ?? throw new ArgumentException("The record batch cannot contain null entries.", nameof(records));
-            object? key = _model.KeyProperty.GetValueAsObject(record);
-            if (key is null || IsDefaultKey(key) && _model.KeyProperty.IsAutoGenerated)
-            {
-                key = GenerateKey();
-                _model.KeyProperty.SetValueAsObject(record, key);
-            }
-
-            keyJsons[i] = SerializeKeyObject(key);
+            keyJsons[i] = _accessor.PrepareKey(record);
             if (!seenKeys.Add(keyJsons[i]))
             {
                 throw new ArgumentException("The record batch contains duplicate keys.", nameof(records));
             }
 
-            vectors[i] = PrepareStoredVector(GetVector(
-                _model.VectorProperty.GetValueAsObject(record),
-                _model.VectorProperty.ModelName,
-                _model.VectorProperty.Dimensions));
-            recordJsons[i] = JsonSerializer.Serialize(record, _serializerOptions);
+            vectors[i] = _accessor.GetVector(record);
+            VectorValues.Validate(vectors[i].Span, vectorProperty.ModelName, vectorProperty.Dimensions);
+            recordJsons[i] = _accessor.Serialize(record);
         }
 
         int dimension = vectors[0].Length;
@@ -270,7 +222,12 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
                 throw new ArgumentException("All vectors in an upsert batch must have the same dimension.", nameof(records));
             }
 
-            vectors[i].CopyTo(packedInput, i * dimension);
+            Span<float> destination = packedInput.AsSpan(i * dimension, dimension);
+            vectors[i].Span.CopyTo(destination);
+            if (_schema.NormalizesVectors)
+            {
+                VectorValues.Normalize(destination);
+            }
         }
 
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -282,8 +239,7 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 string keyJson = keyJsons[i];
-                ulong id;
-                if (state.KeyToId.TryGetValue(keyJson, out id))
+                if (state.KeyToId.TryGetValue(keyJson, out ulong id))
                 {
                     state.Index.Remove(id);
                     state.Records.Remove(IdKey(id));
@@ -312,6 +268,7 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
         }
     }
 
+    /// <inheritdoc />
     public override async IAsyncEnumerable<VectorSearchResult<TRecord>> SearchAsync<TInput>(
         TInput searchValue,
         int top,
@@ -324,6 +281,22 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
             yield break;
         }
 
+        int skip = options?.Skip ?? 0;
+        ArgumentOutOfRangeException.ThrowIfNegative(skip);
+        VectorPropertyModel vectorProperty = options?.VectorProperty is null
+            ? _schema.VectorProperty
+            : _schema.Model.GetVectorPropertyOrSingle(options);
+        ReadOnlyMemory<float> query = VectorValues.ToMemory(searchValue, nameof(searchValue));
+        VectorValues.Validate(query.Span, nameof(searchValue), vectorProperty.Dimensions);
+        if (_schema.NormalizesVectors)
+        {
+            float[] normalized = query.ToArray();
+            VectorValues.Normalize(normalized);
+            query = normalized;
+        }
+
+        Func<TRecord, bool>? predicate = options?.Filter?.Compile();
+        bool includeVectors = options?.IncludeVectors == true;
         List<VectorSearchResult<TRecord>> results = [];
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -334,11 +307,6 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
                 yield break;
             }
 
-            VectorPropertyModel vectorProperty = _model.GetVectorPropertyOrSingle(options ?? new VectorSearchOptions<TRecord>());
-            float[] query = PrepareQueryVector(GetVector(searchValue, nameof(searchValue), vectorProperty.Dimensions));
-            Func<TRecord, bool>? predicate = options?.Filter?.Compile();
-            int skip = options?.Skip ?? 0;
-            ArgumentOutOfRangeException.ThrowIfNegative(skip);
             ulong[]? allowlist = null;
             if (predicate is not null)
             {
@@ -346,7 +314,7 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
                 foreach ((string idText, string json) in state.Records)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    if (predicate(DeserializeRecord(json)))
+                    if (predicate(_accessor.Deserialize(json, includeVectors: true)))
                     {
                         ids.Add(ulong.Parse(idText, CultureInfo.InvariantCulture));
                     }
@@ -363,18 +331,18 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
             int candidateCount = options?.ScoreThreshold is not null
                 ? (allowlist?.Length ?? state.Records.Count)
                 : checked(top + skip);
-            (float[] scores, ulong[] resultIds) = state.Index.SearchWithAllowlist(query, candidateCount, allowlist);
+            (float[] scores, ulong[] resultIds) = state.Index.SearchWithAllowlist(query.Span, candidateCount, allowlist);
             double? scoreThreshold = options?.ScoreThreshold;
+            bool isDistance = _schema.DistanceFunction is DistanceFunction.CosineDistance or DistanceFunction.NegativeDotProductSimilarity;
             for (int i = 0; i < resultIds.Length; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                float score = _distanceFunction switch
+                float score = _schema.DistanceFunction switch
                 {
                     DistanceFunction.CosineDistance => 1f - scores[i],
                     DistanceFunction.NegativeDotProductSimilarity => -scores[i],
                     _ => scores[i]
                 };
-                bool isDistance = _distanceFunction is DistanceFunction.CosineDistance or DistanceFunction.NegativeDotProductSimilarity;
                 if (scoreThreshold is double threshold &&
                     (isDistance ? score > threshold : score < threshold))
                 {
@@ -392,13 +360,7 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
                     throw new InvalidDataException($"Index contains record id {resultIds[i]} with no corresponding record payload.");
                 }
 
-                TRecord record = DeserializeRecord(json);
-                if (options?.IncludeVectors != true)
-                {
-                    record = WithoutVectors(record);
-                }
-
-                results.Add(new VectorSearchResult<TRecord>(record, score));
+                results.Add(new VectorSearchResult<TRecord>(_accessor.Deserialize(json, includeVectors), score));
             }
         }
         finally
@@ -413,6 +375,7 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
         }
     }
 
+    /// <inheritdoc />
     public override object? GetService(Type serviceType, object? serviceKey = null)
     {
         ArgumentNullException.ThrowIfNull(serviceType);
@@ -420,22 +383,24 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
     }
 
     private async Task<State?> LoadIfExistsAsync(CancellationToken cancellationToken)
-        => File.Exists(_path) ? await LoadAsync(cancellationToken).ConfigureAwait(false) : null;
-
-    private async Task<State> LoadAsync(CancellationToken cancellationToken)
     {
-        CollectionImage image = await CollectionStorage.ReadImageAsync(_path, cancellationToken).ConfigureAwait(false);
+        CollectionImage? image = await _store.ReadImageAsync(Name, cancellationToken).ConfigureAwait(false);
+        if (image is null)
+        {
+            return null;
+        }
+
         if (image.Index is null || image.KeyToId is null || image.Records is null || image.Schema is null || image.Name is null)
         {
-            throw new InvalidDataException($"Collection image '{_path}' is missing required data.");
+            throw new InvalidDataException($"The image of collection '{Name}' is missing required data.");
         }
 
         if (!string.Equals(image.Name, Name, StringComparison.Ordinal))
         {
-            throw new InvalidDataException($"Collection image '{_path}' is named '{image.Name}', not '{Name}'.");
+            throw new InvalidDataException($"The image stored for collection '{Name}' is named '{image.Name}'.");
         }
 
-        if (!string.Equals(image.Schema, _schema, StringComparison.Ordinal))
+        if (!string.Equals(image.Schema, _schema.Fingerprint, StringComparison.Ordinal))
         {
             throw new InvalidOperationException($"Collection '{Name}' was created with a different record schema.");
         }
@@ -447,193 +412,39 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
             image.KeyToId.Values.Any(id => !index.Contains(id) || !image.Records.ContainsKey(IdKey(id))) ||
             image.Records.Keys.Any(id => !ulong.TryParse(id, CultureInfo.InvariantCulture, out ulong value) || !index.Contains(value)))
         {
-            throw new InvalidDataException($"Collection image '{_path}' has inconsistent record and index mappings.");
+            throw new InvalidDataException($"The image of collection '{Name}' has inconsistent record and index mappings.");
         }
 
         return new State(index, image.KeyToId, image.Records, image.NextId);
     }
 
     private State NewState()
-        => new(IdMapIndex.NewLazy(_bitWidth), new Dictionary<string, ulong>(StringComparer.Ordinal),
+        => new(IdMapIndex.NewLazy(_store.BitWidth), new Dictionary<string, ulong>(StringComparer.Ordinal),
             new Dictionary<string, string>(StringComparer.Ordinal), 1);
 
-    private async Task SaveAsync(State state, CancellationToken cancellationToken)
-        => await CollectionStorage.WriteImageAsync(_path, new CollectionImage
+    private ValueTask SaveAsync(State state, CancellationToken cancellationToken)
+        => _store.WriteImageAsync(new CollectionImage
         {
             Name = Name,
-            Schema = _schema,
+            Schema = _schema.Fingerprint,
             Index = state.Index.ToBytes(),
             KeyToId = state.KeyToId,
             Records = state.Records,
             NextId = state.NextId
-        }, cancellationToken).ConfigureAwait(false);
+        }, cancellationToken);
 
-    private string SerializeKey(TKey key)
-        => SerializeKeyObject(key);
-
-    private string SerializeKeyObject(object key)
-        => JsonSerializer.Serialize(key, key.GetType(), _serializerOptions);
-
-    private string IdKey(ulong id) => id.ToString(CultureInfo.InvariantCulture);
-
-    private TRecord DeserializeRecord(string json)
-    {
-        TRecord record = JsonSerializer.Deserialize<TRecord>(json, _serializerOptions)
-            ?? throw new InvalidDataException($"A record in collection '{Name}' deserialized to null.");
-
-        if (record is IDictionary<string, object?> dynamicRecord)
-        {
-            foreach (PropertyModel property in _model.Properties)
-            {
-                if (dynamicRecord.TryGetValue(property.ModelName, out object? value) && value is JsonElement element)
-                {
-                    dynamicRecord[property.ModelName] = element.Deserialize(property.Type, _serializerOptions);
-                }
-            }
-        }
-
-        return record;
-    }
-
-    private TRecord WithoutVectors(TRecord record)
-    {
-        if (_model.VectorProperties.Count == 0)
-        {
-            return record;
-        }
-
-        JsonNode? node = JsonSerializer.SerializeToNode(record, _serializerOptions);
-        if (node is JsonObject obj)
-        {
-            foreach (VectorPropertyModel property in _model.VectorProperties)
-            {
-                string jsonName;
-                if (property.PropertyInfo is null)
-                {
-                    jsonName = _serializerOptions.DictionaryKeyPolicy?.ConvertName(property.ModelName) ?? property.ModelName;
-                }
-                else
-                {
-                    jsonName = property.PropertyInfo.GetCustomAttributes(typeof(JsonPropertyNameAttribute), inherit: true)
-                        .OfType<JsonPropertyNameAttribute>()
-                        .FirstOrDefault()?.Name
-                        ?? _serializerOptions.PropertyNamingPolicy?.ConvertName(property.PropertyInfo.Name)
-                        ?? property.PropertyInfo.Name;
-                }
-
-                obj.Remove(jsonName);
-            }
-        }
-
-        return node is null
-            ? record
-            : node.Deserialize<TRecord>(_serializerOptions) ?? record;
-    }
-
-    private static float[] GetVector(object? value, string propertyName, int? dimensions)
-    {
-        float[] vector = value switch
-        {
-            float[] array => array,
-            Memory<float> memory => memory.ToArray(),
-            ReadOnlyMemory<float> memory => memory.ToArray(),
-            IEnumerable<float> enumerable => enumerable.ToArray(),
-            _ => throw new ArgumentException($"Vector property '{propertyName}' must contain float coordinates.")
-        };
-
-        if (vector.Length == 0)
-        {
-            throw new ArgumentException($"Vector property '{propertyName}' cannot be empty.");
-        }
-
-        foreach (float coordinate in vector)
-        {
-            if (!float.IsFinite(coordinate) || MathF.Abs(coordinate) >= 1e16f)
-            {
-                throw new ArgumentException($"Vector property '{propertyName}' contains an invalid coordinate.");
-            }
-        }
-
-        if (dimensions is int expected && vector.Length != expected)
-        {
-            throw new ArgumentException($"Vector property '{propertyName}' requires {expected} dimensions, but received {vector.Length}.");
-        }
-
-        return vector;
-    }
-
-    private float[] PrepareStoredVector(float[] vector)
-        => _distanceFunction is DistanceFunction.CosineSimilarity or DistanceFunction.CosineDistance
-            ? Normalize(vector)
-            : vector;
-
-    private float[] PrepareQueryVector(float[] vector)
-        => _distanceFunction is DistanceFunction.CosineSimilarity or DistanceFunction.CosineDistance
-            ? Normalize(vector)
-            : vector;
-
-    private static float[] Normalize(float[] vector)
-    {
-        float norm = TensorPrimitives.Norm(vector);
-        if (norm > 1e-10f)
-        {
-            TensorPrimitives.Divide(vector, norm, vector);
-        }
-        else
-        {
-            Array.Clear(vector);
-        }
-
-        return vector;
-    }
-
-    private static object GenerateKey()
-    {
-        Type keyType = typeof(TKey);
-        if (keyType == typeof(Guid))
-        {
-            return Guid.NewGuid();
-        }
-
-        throw new InvalidOperationException($"Automatic key generation is not supported for key type '{keyType}'.");
-    }
-
-    private static bool IsDefaultKey(object key)
-        => key switch
-        {
-            Guid guid => guid == Guid.Empty,
-            string text => string.IsNullOrEmpty(text),
-            _ => key.GetType().IsValueType && Equals(key, Activator.CreateInstance(key.GetType()))
-        };
-
-    private static string CreateSchemaFingerprint(CollectionModel model)
-    {
-        var entries = new List<string>(model.Properties.Count);
-        foreach (PropertyModel property in model.Properties)
-        {
-            string kind = property switch
-            {
-                KeyPropertyModel => "key",
-                VectorPropertyModel vector => $"vector:{vector.Dimensions}:{vector.DistanceFunction}",
-                _ => "data"
-            };
-            entries.Add($"{kind}|{property.ModelName}|{property.StorageName}|{property.Type.AssemblyQualifiedName}");
-        }
-
-        entries.Sort(StringComparer.Ordinal);
-        return string.Join('\n', entries);
-    }
+    private static string IdKey(ulong id) => id.ToString(CultureInfo.InvariantCulture);
 
     private static IEnumerable<TRecord> ApplyOrdering(
         IEnumerable<TRecord> records,
         Func<FilteredRecordRetrievalOptions<TRecord>.OrderByDefinition, FilteredRecordRetrievalOptions<TRecord>.OrderByDefinition>? orderByFactory)
     {
-        IOrderedEnumerable<TRecord>? ordered = null;
         if (orderByFactory is null)
         {
             return records;
         }
 
+        IOrderedEnumerable<TRecord>? ordered = null;
         var orderBy = orderByFactory(new FilteredRecordRetrievalOptions<TRecord>.OrderByDefinition());
         foreach (FilteredRecordRetrievalOptions<TRecord>.OrderByDefinition.SortInfo sort in orderBy.Values)
         {
