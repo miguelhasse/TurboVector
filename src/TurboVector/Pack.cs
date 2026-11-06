@@ -2,7 +2,7 @@ namespace TurboVector;
 
 internal static class Pack
 {
-    internal static byte[] ExtractCodes(ReadOnlySpan<byte> packedCodes, int nVectors, int bits, int dim)
+    internal static void ExtractCodes(ReadOnlySpan<byte> packedCodes, int nVectors, int bits, int dim, Span<byte> codes)
     {
         int bytesPerPlane = dim / 8;
         int bytesPerRow = checked(bytesPerPlane * bits);
@@ -12,7 +12,12 @@ internal static class Pack
             throw new ArgumentException($"Expected packedCodes length {expectedLength}, got {packedCodes.Length}.", nameof(packedCodes));
         }
 
-        byte[] codes = new byte[checked(nVectors * dim)];
+        int expectedCodeLength = checked(nVectors * dim);
+        if (codes.Length != expectedCodeLength)
+        {
+            throw new ArgumentException($"Expected codes length {expectedCodeLength}, got {codes.Length}.", nameof(codes));
+        }
+
         for (int row = 0; row < nVectors; row++)
         {
             int packedRowStart = row * bytesPerRow;
@@ -33,8 +38,6 @@ internal static class Pack
                 codes[codeRowStart + d] = code;
             }
         }
-
-        return codes;
     }
 
     internal static (byte[] Blocked, int BlockCount) Repack(ReadOnlySpan<byte> packedCodes, int nVectors, int bits, int dim)

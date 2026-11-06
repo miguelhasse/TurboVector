@@ -3,6 +3,40 @@ namespace TurboVector.Tests;
 public class RotationTests
 {
     [Fact]
+    public void ScratchMustNotOverlapRotationInputsOrOutputs()
+    {
+        const int dim = 16;
+        var rotation = Rotation.Create(dim);
+        float[] shared = TestHelpers.RandVec(dim + 1, 123);
+        float[] original = shared.ToArray();
+        float[] separate = new float[dim];
+
+        Assert.Throws<ArgumentException>(() => rotation.Apply(shared.AsSpan(0, dim), shared.AsSpan(1, dim)));
+        Assert.Equal(original, shared);
+        Assert.Throws<ArgumentException>(() => rotation.ApplyScaledInto(
+            shared.AsSpan(0, dim), 1f, separate, shared.AsSpan(1, dim)));
+        Assert.Equal(original, shared);
+        Assert.Throws<ArgumentException>(() => rotation.ApplyScaledInto(
+            separate, 1f, shared.AsSpan(0, dim), shared.AsSpan(1, dim)));
+        Assert.Equal(original, shared);
+    }
+
+    [Fact]
+    public void ScaledRotationCanUseTheSourceAsItsDestination()
+    {
+        const int dim = 16;
+        var rotation = Rotation.Create(dim);
+        float[] source = TestHelpers.RandVec(dim, 124);
+        float[] expected = new float[dim];
+        rotation.ApplyScaledInto(source, 0.5f, expected, new float[dim]);
+
+        float[] inPlace = source.ToArray();
+        rotation.ApplyScaledInto(inPlace, 0.5f, inPlace, new float[dim]);
+
+        Assert.Equal(expected, inPlace);
+    }
+
+    [Fact]
     public void OrthogonalAcrossDims()
     {
         foreach (int dim in new[] { 32, 64, 128, 256 })

@@ -62,7 +62,7 @@ For other platforms, use the appropriate runtime identifier and executable path.
 
 ## Usage at a Glance
 
-Dimensions must be positive multiples of 8 up to 16,384, and `bitWidth` must be 2, 3, or 4. Vector and query coordinates must be finite and have magnitude below `1e16`. `.tv` and `.tvim` snapshots use the Rust-compatible v8 container, with v7/v8 loading, TQ+ calibration persistence, stream APIs, and atomic replacement. `Sync(path)` durably appends complete units where possible, uses atomic replacement when changes require compaction, and detects a stale sync cursor. The older C# v2 format is intentionally not loaded.
+Dimensions must be positive multiples of 8 up to 16,384, and `bitWidth` must be 2, 3, or 4. Vector and query coordinates must be finite and have magnitude below `1e16`. `.tv` and `.tvim` snapshots use the Rust-compatible v8 container, with v7/v8 loading, TQ+ calibration persistence, stream APIs, and atomic replacement. `Sync(path)` durably appends complete units where possible, uses atomic replacement when changes require compaction, and detects a stale sync cursor. Path-based writers with this version of TurboVector running as the same user on the same host coordinate; other writers require external synchronization. The older C# v2 format is intentionally not loaded.
 
 ```csharp
 using TurboVector;
@@ -127,12 +127,7 @@ idMap.Write("my_index.tvim");
 
 ## Performance Notes
 
-The hot paths use [`System.Numerics.Tensors.TensorPrimitives`](https://learn.microsoft.com/en-us/dotnet/api/system.numerics.tensors.tensorprimitives) for JIT-vectorised SIMD:
-
-- **Encode:** `TensorPrimitives.Norm` + `Multiply` (normalize), `TensorPrimitives.Dot` (rotation)
-- **Search:** `TensorPrimitives.Dot` in `RotateQueries` (dominates query latency for large dims)
-
-LUT score accumulation (`Score2/3/4Bit`) uses tightly-bounded scalar loops that the JIT auto-vectorises well; further optimisation with `System.Runtime.Intrinsics` (AVX-512 `VPSHUFB`) is a future opportunity.
+The index uses a deterministic block-Hadamard rotation for encoding and search, avoiding a dense dimension-by-dimension rotation matrix. The rotation uses AVX where available; the dense-matrix overloads use [`System.Numerics.Tensors.TensorPrimitives`](https://learn.microsoft.com/en-us/dotnet/api/system.numerics.tensors.tensorprimitives). Recalibration processes stored rows in bounded chunks rather than allocating a full-size floating-point reconstruction.
 
 ## Project READMEs
 

@@ -88,6 +88,52 @@ public sealed class TurboQuantVectorStoreTests : IDisposable
         Assert.False(await reopened.CollectionExistsAsync(cancellationToken));
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public async Task ScoreThresholdStillHonorsTopAndSkip(int skip)
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var store = new InMemoryVectorStore();
+        TurboQuantCollection<string, Document> collection = store.GetCollection("documents", TestMappings.Document);
+        await collection.UpsertAsync(
+        [
+            new Document("first", "guide", 1, Axis0),
+            new Document("second", "guide", 2, Axis1),
+            new Document("third", "guide", 3, Axis2)
+        ], cancellationToken);
+
+        List<VectorSearchResult<Document>> expected = await ToListAsync(collection.SearchAsync(
+            new ReadOnlyMemory<float>(Axis0), 1, new VectorSearchOptions<Document> { Skip = skip }, cancellationToken));
+        List<VectorSearchResult<Document>> actual = await ToListAsync(collection.SearchAsync(
+            new ReadOnlyMemory<float>(Axis0), 1,
+            new VectorSearchOptions<Document> { Skip = skip, ScoreThreshold = -2 }, cancellationToken));
+
+        Assert.Single(expected);
+        Assert.Equal(expected.Select(result => result.Record.Id), actual.Select(result => result.Record.Id));
+    }
+
+    [Theory]
+    [InlineData(int.MaxValue, 1, 2)]
+    [InlineData(1, int.MaxValue, 0)]
+    public async Task SearchBoundsLargeTopAndSkipToCollectionSize(int top, int skip, int expectedCount)
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var store = new InMemoryVectorStore();
+        TurboQuantCollection<string, Document> collection = store.GetCollection("documents", TestMappings.Document);
+        await collection.UpsertAsync(
+        [
+            new Document("first", "guide", 1, Axis0),
+            new Document("second", "guide", 2, Axis1),
+            new Document("third", "guide", 3, Axis2)
+        ], cancellationToken);
+
+        List<VectorSearchResult<Document>> results = await ToListAsync(collection.SearchAsync(
+            new ReadOnlyMemory<float>(Axis0), top, new VectorSearchOptions<Document> { Skip = skip }, cancellationToken));
+
+        Assert.Equal(expectedCount, results.Count);
+    }
+
     [Fact]
     public async Task CosineSimilarityIgnoresVectorMagnitudeWithoutMutatingInputs()
     {
@@ -144,6 +190,93 @@ public sealed class TurboQuantVectorStoreTests : IDisposable
         Assert.Equal("notes", withoutVector["Category"]);
         Assert.Equal(7, withoutVector["Rank"]);
         Assert.False(withoutVector.ContainsKey("Embedding"));
+    }
+
+    [Fact]
+    public async Task DynamicRecordsRespectDictionaryKeyPolicies()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var definition = new VectorStoreCollectionDefinition
+        {
+            Properties =
+            [
+                new VectorStoreKeyProperty("Id", typeof(string)),
+                new VectorStoreDataProperty("Rank", typeof(int)),
+                new VectorStoreVectorProperty("Embedding", typeof(ReadOnlyMemory<float>), 8)
+            ]
+        };
+        var options = new JsonSerializerOptions { DictionaryKeyPolicy = JsonNamingPolicy.CamelCase };
+        var store = new TurboQuantFileSystemVectorStore(_directory, serializerOptions: options);
+        VectorStoreCollection<object, Dictionary<string, object?>> collection = store.GetDynamicCollection("dynamic", definition);
+        await collection.UpsertAsync(new Dictionary<string, object?>
+        {
+            ["Id"] = "dynamic-1",
+            ["Rank"] = 7,
+            ["Embedding"] = new ReadOnlyMemory<float>(Axis0)
+        }, cancellationToken);
+
+        Dictionary<string, object?>? full = await collection.GetAsync(
+            "dynamic-1", new RecordRetrievalOptions { IncludeVectors = true }, cancellationToken);
+        Assert.NotNull(full);
+        Assert.Equal("dynamic-1", full["Id"]);
+        Assert.Equal(7, full["Rank"]);
+        Assert.IsType<ReadOnlyMemory<float>>(full["Embedding"]);
+
+        Dictionary<string, object?>? withoutVector = await collection.GetAsync("dynamic-1", cancellationToken: cancellationToken);
+        Assert.NotNull(withoutVector);
+        Assert.Equal(7, withoutVector["Rank"]);
+        Assert.False(withoutVector.ContainsKey("Embedding"));
+        Assert.False(withoutVector.ContainsKey("embedding"));
+
+        List<VectorSearchResult<Dictionary<string, object?>>> results = await ToListAsync(collection.SearchAsync(
+            new ReadOnlyMemory<float>(Axis0), 1,
+            new VectorSearchOptions<Dictionary<string, object?>> { Filter = record => (int)record["Rank"]! == 7 },
+            cancellationToken));
+        Assert.Equal("dynamic-1", Assert.Single(results).Record["Id"]);
+    }
+
+    [Fact]
+    public async Task DynamicRecordsRejectDictionaryKeyPolicyCollisions()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var definition = new VectorStoreCollectionDefinition
+        {
+            Properties =
+            [
+                new VectorStoreKeyProperty("Id", typeof(string)),
+                new VectorStoreVectorProperty("Embedding", typeof(ReadOnlyMemory<float>), 8)
+            ]
+        };
+        var options = new JsonSerializerOptions { DictionaryKeyPolicy = JsonNamingPolicy.CamelCase };
+        var store = new TurboQuantFileSystemVectorStore(_directory, serializerOptions: options);
+        VectorStoreCollection<object, Dictionary<string, object?>> collection = store.GetDynamicCollection("dynamic", definition);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => collection.UpsertAsync(new Dictionary<string, object?>
+        {
+            ["Id"] = "dynamic-1",
+            ["id"] = "conflicting",
+            ["Embedding"] = new ReadOnlyMemory<float>(Axis0)
+        }, cancellationToken));
+        Assert.False(await collection.CollectionExistsAsync(cancellationToken));
+    }
+
+    [Fact]
+    public void DynamicDefinitionsRejectDictionaryKeyPolicyCollisions()
+    {
+        var definition = new VectorStoreCollectionDefinition
+        {
+            Properties =
+            [
+                new VectorStoreKeyProperty("Id", typeof(string)),
+                new VectorStoreDataProperty("id", typeof(string)),
+                new VectorStoreVectorProperty("Embedding", typeof(ReadOnlyMemory<float>), 8)
+            ]
+        };
+        var options = new JsonSerializerOptions { DictionaryKeyPolicy = JsonNamingPolicy.CamelCase };
+
+        InvalidOperationException error = Assert.Throws<InvalidOperationException>(
+            () => new TurboQuantFileSystemVectorStore(_directory, serializerOptions: options).GetDynamicCollection("dynamic", definition));
+        Assert.Contains("multiple properties", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -212,6 +345,265 @@ public sealed class TurboQuantVectorStoreTests : IDisposable
         InvalidOperationException error = Assert.Throws<InvalidOperationException>(
             () => new InMemoryVectorStore().GetCollection("documents", mapping));
         Assert.Contains("StorageName", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RequiredVectorPropertiesCanBeExcludedFromRecords()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var mapping = new TurboQuantRecordMapping<string, RequiredDocument>
+        {
+            Definition = new VectorStoreCollectionDefinition
+            {
+                Properties =
+                [
+                    new VectorStoreKeyProperty("Id", typeof(string)),
+                    new VectorStoreVectorProperty("Embedding", typeof(ReadOnlyMemory<float>), 8)
+                ]
+            },
+            RecordTypeInfo = TestJsonContext.Default.RequiredDocument,
+            KeyTypeInfo = TestJsonContext.Default.String,
+            GetKey = static document => document.Id,
+            GetVector = static document => document.Embedding
+        };
+        var store = new InMemoryVectorStore();
+        TurboQuantCollection<string, RequiredDocument> collection = store.GetCollection("required", mapping);
+        await collection.UpsertAsync(new RequiredDocument { Id = "a", Embedding = Axis0 }, cancellationToken);
+
+        RequiredDocument? result = await collection.GetAsync("a", cancellationToken: cancellationToken);
+        Assert.NotNull(result);
+        Assert.Equal("a", result.Id);
+        Assert.True(result.Embedding.IsEmpty);
+
+        List<VectorSearchResult<RequiredDocument>> results = await ToListAsync(collection.SearchAsync(
+            new ReadOnlyMemory<float>(Axis0), 1, cancellationToken: cancellationToken));
+        Assert.True(Assert.Single(results).Record.Embedding.IsEmpty);
+    }
+
+    [Fact]
+    public async Task RequiredVectorsWithCustomJsonConvertersCanBeExcluded()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var mapping = new TurboQuantRecordMapping<string, RequiredConvertedDocument>
+        {
+            Definition = new VectorStoreCollectionDefinition
+            {
+                Properties =
+                [
+                    new VectorStoreKeyProperty("Id", typeof(string)),
+                    new VectorStoreVectorProperty("Embedding", typeof(ReadOnlyMemory<float>), 8)
+                ]
+            },
+            RecordTypeInfo = TestJsonContext.Default.RequiredConvertedDocument,
+            KeyTypeInfo = TestJsonContext.Default.String,
+            GetKey = static document => document.Id,
+            GetVector = static document => document.Embedding
+        };
+        var store = new InMemoryVectorStore();
+        TurboQuantCollection<string, RequiredConvertedDocument> collection = store.GetCollection("required", mapping);
+        await collection.UpsertAsync(new RequiredConvertedDocument { Id = "a", Embedding = Axis0 }, cancellationToken);
+
+        RequiredConvertedDocument? full = await collection.GetAsync(
+            "a", new RecordRetrievalOptions { IncludeVectors = true }, cancellationToken);
+        Assert.NotNull(full);
+        Assert.Equal(Axis0, full.Embedding.ToArray());
+        RequiredConvertedDocument? withoutVector = await collection.GetAsync("a", cancellationToken: cancellationToken);
+        Assert.NotNull(withoutVector);
+        Assert.True(withoutVector.Embedding.IsEmpty);
+    }
+
+    [Fact]
+    public async Task RequiredVectorsWithGlobalJsonConvertersCanBeExcluded()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var options = new JsonSerializerOptions();
+        options.Converters.Add(new StringVectorConverter());
+        var context = new TestJsonContext(options);
+        var mapping = new TurboQuantRecordMapping<string, RequiredDocument>
+        {
+            Definition = new VectorStoreCollectionDefinition
+            {
+                Properties =
+                [
+                    new VectorStoreKeyProperty("Id", typeof(string)),
+                    new VectorStoreVectorProperty("Embedding", typeof(ReadOnlyMemory<float>), 8)
+                ]
+            },
+            RecordTypeInfo = context.RequiredDocument,
+            KeyTypeInfo = context.String,
+            GetKey = static document => document.Id,
+            GetVector = static document => document.Embedding
+        };
+        var store = new InMemoryVectorStore();
+        TurboQuantCollection<string, RequiredDocument> collection = store.GetCollection("required", mapping);
+        await collection.UpsertAsync(new RequiredDocument { Id = "a", Embedding = Axis0 }, cancellationToken);
+
+        RequiredDocument? withoutVector = await collection.GetAsync("a", cancellationToken: cancellationToken);
+        Assert.NotNull(withoutVector);
+        Assert.True(withoutVector.Embedding.IsEmpty);
+    }
+
+    [Fact]
+    public async Task RequiredCollectionVectorsCanBeExcluded()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var mapping = new TurboQuantRecordMapping<string, RequiredListDocument>
+        {
+            Definition = new VectorStoreCollectionDefinition
+            {
+                Properties =
+                [
+                    new VectorStoreKeyProperty("Id", typeof(string)),
+                    new VectorStoreVectorProperty("Embedding", typeof(List<float>), 8)
+                ]
+            },
+            RecordTypeInfo = TestJsonContext.Default.RequiredListDocument,
+            KeyTypeInfo = TestJsonContext.Default.String,
+            GetKey = static document => document.Id,
+            GetVector = static document => document.Embedding.ToArray()
+        };
+        var store = new InMemoryVectorStore();
+        TurboQuantCollection<string, RequiredListDocument> collection = store.GetCollection("required", mapping);
+        await collection.UpsertAsync(new RequiredListDocument { Id = "a", Embedding = [.. Axis0] }, cancellationToken);
+
+        RequiredListDocument? withoutVector = await collection.GetAsync("a", cancellationToken: cancellationToken);
+        Assert.NotNull(withoutVector);
+        Assert.Empty(withoutVector.Embedding);
+    }
+
+    [Fact]
+    public async Task RequiredImmutableVectorsCanBeExcluded()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var mapping = new TurboQuantRecordMapping<string, RequiredImmutableDocument>
+        {
+            Definition = new VectorStoreCollectionDefinition
+            {
+                Properties =
+                [
+                    new VectorStoreKeyProperty("Id", typeof(string)),
+                    new VectorStoreVectorProperty("Embedding", typeof(System.Collections.Immutable.ImmutableArray<float>), 8)
+                ]
+            },
+            RecordTypeInfo = TestJsonContext.Default.RequiredImmutableDocument,
+            KeyTypeInfo = TestJsonContext.Default.String,
+            GetKey = static document => document.Id,
+            GetVector = static document => document.Embedding.ToArray()
+        };
+        var store = new InMemoryVectorStore();
+        TurboQuantCollection<string, RequiredImmutableDocument> collection = store.GetCollection("required", mapping);
+        await collection.UpsertAsync(new RequiredImmutableDocument { Id = "a", Embedding = [.. Axis0] }, cancellationToken);
+
+        RequiredImmutableDocument? withoutVector = await collection.GetAsync("a", cancellationToken: cancellationToken);
+        Assert.NotNull(withoutVector);
+        Assert.Empty(withoutVector.Embedding);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RequiredNullableVectorsCanBeExcluded(bool useFactory)
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var mapping = new TurboQuantRecordMapping<string, RequiredNullableDocument>
+        {
+            Definition = new VectorStoreCollectionDefinition
+            {
+                Properties =
+                [
+                    new VectorStoreKeyProperty("Id", typeof(string)),
+                    new VectorStoreVectorProperty("Embedding", typeof(ReadOnlyMemory<float>?), 8)
+                ]
+            },
+            RecordTypeInfo = TestJsonContext.Default.RequiredNullableDocument,
+            KeyTypeInfo = TestJsonContext.Default.String,
+            GetKey = static document => document.Id,
+            GetVector = static document => document.Embedding.GetValueOrDefault(),
+            CreateEmptyVector = useFactory ? static () => ReadOnlyMemory<float>.Empty : null
+        };
+        var store = new InMemoryVectorStore();
+        TurboQuantCollection<string, RequiredNullableDocument> collection = store.GetCollection("nullable", mapping);
+        await collection.UpsertAsync(new RequiredNullableDocument { Id = "a", Embedding = Axis0 }, cancellationToken);
+
+        RequiredNullableDocument? result = await collection.GetAsync("a", cancellationToken: cancellationToken);
+        Assert.NotNull(result);
+        Assert.True(result.Embedding is null || result.Embedding.Value.IsEmpty);
+    }
+
+    [Fact]
+    public async Task RequiredCustomVectorsCanUseAnEmptyValueFactory()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var definition = new VectorStoreCollectionDefinition
+        {
+            Properties =
+            [
+                new VectorStoreKeyProperty("Id", typeof(string)),
+                new VectorStoreVectorProperty("Embedding", typeof(EncodedVector), 8)
+            ]
+        };
+        TurboQuantRecordMapping<string, RequiredEncodedDocument> CreateMapping(Func<object?>? createEmptyVector) => new()
+        {
+            Definition = definition,
+            RecordTypeInfo = TestJsonContext.Default.RequiredEncodedDocument,
+            KeyTypeInfo = TestJsonContext.Default.String,
+            GetKey = static document => document.Id,
+            GetVector = static document => document.Embedding.ToArray(),
+            CreateEmptyVector = createEmptyVector
+        };
+
+        var store = new InMemoryVectorStore();
+        TurboQuantCollection<string, RequiredEncodedDocument> missingFactory =
+            store.GetCollection("without-factory", CreateMapping(null));
+        await missingFactory.UpsertAsync(
+            new RequiredEncodedDocument { Id = "a", Embedding = new EncodedVector(Axis0) }, cancellationToken);
+        NotSupportedException error = await Assert.ThrowsAsync<NotSupportedException>(
+            () => missingFactory.GetAsync("a", cancellationToken: cancellationToken));
+        Assert.Contains("CreateEmptyVector", error.Message);
+
+        TurboQuantCollection<string, RequiredEncodedDocument> collection =
+            store.GetCollection("with-factory", CreateMapping(static () => new EncodedVector([])));
+        await collection.UpsertAsync(
+            new RequiredEncodedDocument { Id = "a", Embedding = new EncodedVector(Axis0) }, cancellationToken);
+        RequiredEncodedDocument? result = await collection.GetAsync("a", cancellationToken: cancellationToken);
+        Assert.NotNull(result);
+        Assert.Empty(result.Embedding);
+
+        TurboQuantCollection<string, RequiredEncodedDocument> invalidFactory =
+            store.GetCollection("invalid-factory", CreateMapping(static () => new EncodedVector([1f])));
+        await invalidFactory.UpsertAsync(
+            new RequiredEncodedDocument { Id = "a", Embedding = new EncodedVector(Axis0) }, cancellationToken);
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => invalidFactory.GetAsync("a", cancellationToken: cancellationToken));
+    }
+
+    [Fact]
+    public async Task RequiredConstructorVectorParametersCanBeExcluded()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        var context = new TestJsonContext(new JsonSerializerOptions { RespectRequiredConstructorParameters = true });
+        var mapping = new TurboQuantRecordMapping<string, ConstructorDocument>
+        {
+            Definition = new VectorStoreCollectionDefinition
+            {
+                Properties =
+                [
+                    new VectorStoreKeyProperty("Id", typeof(string)),
+                    new VectorStoreVectorProperty("Embedding", typeof(ReadOnlyMemory<float>), 8)
+                ]
+            },
+            RecordTypeInfo = context.ConstructorDocument,
+            KeyTypeInfo = context.String,
+            GetKey = static document => document.Id,
+            GetVector = static document => document.Embedding
+        };
+        var store = new InMemoryVectorStore();
+        TurboQuantCollection<string, ConstructorDocument> collection = store.GetCollection("constructor", mapping);
+        await collection.UpsertAsync(new ConstructorDocument("a", Axis0), cancellationToken);
+
+        ConstructorDocument? withoutVector = await collection.GetAsync("a", cancellationToken: cancellationToken);
+        Assert.NotNull(withoutVector);
+        Assert.True(withoutVector.Embedding.IsEmpty);
     }
 
     [Theory]

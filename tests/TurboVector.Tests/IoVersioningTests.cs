@@ -322,6 +322,65 @@ public class IoVersioningTests
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ConcurrentSyncRejectsAStaleWriter(bool secondAppends)
+    {
+        const int dim = 64;
+        const int count = 40_000;
+        string path = TestHelpers.TempPath(".tv", "sync-concurrent-rewrite");
+        float[] vectors = new float[count * dim];
+        for (int i = 0; i < count; i++)
+        {
+            vectors[i * dim] = i + 1;
+        }
+
+        var first = new TurboQuantIndex(dim, 4);
+        first.Add(vectors);
+        try
+        {
+            first.Sync(path);
+            TurboQuantIndex second = TurboQuantIndex.Load(path);
+            first.SwapRemove(0);
+            if (secondAppends)
+            {
+                second.Add(TestHelpers.MakeVectors(1, dim, seed: 1001));
+            }
+            else
+            {
+                second.SwapRemove(1);
+            }
+
+            using var start = new ManualResetEventSlim();
+            Task<Exception?> firstWrite = Task.Factory.StartNew(() =>
+            {
+                start.Wait();
+                return Record.Exception(() => first.Sync(path));
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            Task<Exception?> secondWrite = Task.Factory.StartNew(() =>
+            {
+                start.Wait();
+                return Record.Exception(() => second.Sync(path));
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            start.Set();
+            Exception?[] errors = await Task.WhenAll(firstWrite, secondWrite);
+
+            Assert.True(
+                errors[0] is null && errors[1] is InvalidDataException ||
+                errors[1] is null && errors[0] is InvalidDataException,
+                $"First writer: {errors[0]}; second writer: {errors[1]}");
+            TurboQuantIndex loaded = TurboQuantIndex.Load(path);
+            TurboQuantIndex winner = errors[0] is null ? first : second;
+            Assert.Equal(winner.PackedCodes.ToArray(), loaded.PackedCodes.ToArray());
+            Assert.Equal(winner.Scales.ToArray(), loaded.Scales.ToArray());
+        }
+        finally
+        {
+            TestHelpers.DeleteFileIfExists(path);
+        }
+    }
+
     [Fact]
     public void SyncRecoversFromOrphanedAppendedUnits()
     {

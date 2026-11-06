@@ -328,9 +328,7 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
                 allowlist = [.. ids];
             }
 
-            int candidateCount = options?.ScoreThreshold is not null
-                ? (allowlist?.Length ?? state.Records.Count)
-                : checked(top + skip);
+            int candidateCount = (int)Math.Min((long)top + skip, allowlist?.Length ?? state.Records.Count);
             (float[] scores, ulong[] resultIds) = state.Index.SearchWithAllowlist(query.Span, candidateCount, allowlist);
             double? scoreThreshold = options?.ScoreThreshold;
             bool isDistance = _schema.DistanceFunction is DistanceFunction.CosineDistance or DistanceFunction.NegativeDotProductSimilarity;
@@ -361,6 +359,10 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
                 }
 
                 results.Add(new VectorSearchResult<TRecord>(_accessor.Deserialize(json, includeVectors), score));
+                if (results.Count == top)
+                {
+                    break;
+                }
             }
         }
         finally

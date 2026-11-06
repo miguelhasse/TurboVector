@@ -1,6 +1,9 @@
 using Microsoft.Extensions.VectorData;
 using System.Collections.Concurrent;
+using System.Collections.Immutable;
+using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace Hasseware.Extensions.VectorData.TurboQuant.Tests;
@@ -39,9 +42,114 @@ internal sealed class GuidDocument
     public float[] Embedding { get; set; } = [];
 }
 
+internal sealed class RequiredDocument
+{
+    public required string Id { get; init; }
+
+    public required ReadOnlyMemory<float> Embedding { get; init; }
+}
+
+internal sealed class RequiredConvertedDocument
+{
+    public required string Id { get; init; }
+
+    [JsonConverter(typeof(StringVectorConverter))]
+    public required ReadOnlyMemory<float> Embedding { get; init; }
+}
+
+internal sealed class RequiredListDocument
+{
+    public required string Id { get; init; }
+
+    public required List<float> Embedding { get; init; }
+}
+
+internal sealed class RequiredImmutableDocument
+{
+    public required string Id { get; init; }
+
+    public required ImmutableArray<float> Embedding { get; init; }
+}
+
+internal sealed class RequiredNullableDocument
+{
+    public required string Id { get; init; }
+
+    public required ReadOnlyMemory<float>? Embedding { get; init; }
+}
+
+internal sealed class RequiredEncodedDocument
+{
+    public required string Id { get; init; }
+
+    [JsonConverter(typeof(EncodedVectorConverter))]
+    public required EncodedVector Embedding { get; init; }
+}
+
+internal sealed class EncodedVector(float[] values) : IEnumerable<float>
+{
+    public IEnumerator<float> GetEnumerator() => ((IEnumerable<float>)values).GetEnumerator();
+
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+}
+
+internal sealed class EncodedVectorConverter : JsonConverter<EncodedVector>
+{
+    public override EncodedVector Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType != JsonTokenType.String)
+        {
+            throw new JsonException("Expected an encoded vector string.");
+        }
+
+        string text = reader.GetString()!;
+        return new EncodedVector(text.Length == 0
+            ? []
+            : text.Split(',').Select(static value => float.Parse(value, CultureInfo.InvariantCulture)).ToArray());
+    }
+
+    public override void Write(Utf8JsonWriter writer, EncodedVector value, JsonSerializerOptions options)
+        => writer.WriteStringValue(string.Join(',', value.Select(static item => item.ToString("R", CultureInfo.InvariantCulture))));
+}
+
+internal sealed class ConstructorDocument
+{
+    [JsonConstructor]
+    public ConstructorDocument(string id, ReadOnlyMemory<float> embedding)
+    {
+        Id = id;
+        Embedding = embedding;
+    }
+
+    public string Id { get; }
+
+    public ReadOnlyMemory<float> Embedding { get; }
+}
+
+internal sealed class StringVectorConverter : JsonConverter<ReadOnlyMemory<float>>
+{
+    public override ReadOnlyMemory<float> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        string text = reader.GetString() ?? throw new JsonException("Missing vector.");
+        return text.Length == 0
+            ? ReadOnlyMemory<float>.Empty
+            : text.Split(',').Select(static value => float.Parse(value, CultureInfo.InvariantCulture)).ToArray();
+    }
+
+    public override void Write(Utf8JsonWriter writer, ReadOnlyMemory<float> value, JsonSerializerOptions options)
+        => writer.WriteStringValue(string.Join(',', value.ToArray().Select(static item => item.ToString("R", CultureInfo.InvariantCulture))));
+}
+
 [JsonSerializable(typeof(Document))]
 [JsonSerializable(typeof(CosineDocument))]
 [JsonSerializable(typeof(GuidDocument))]
+[JsonSerializable(typeof(RequiredDocument))]
+[JsonSerializable(typeof(RequiredConvertedDocument))]
+[JsonSerializable(typeof(RequiredListDocument))]
+[JsonSerializable(typeof(RequiredImmutableDocument))]
+[JsonSerializable(typeof(RequiredNullableDocument))]
+[JsonSerializable(typeof(RequiredEncodedDocument))]
+[JsonSerializable(typeof(ConstructorDocument))]
 [JsonSerializable(typeof(string))]
 [JsonSerializable(typeof(Guid))]
 internal sealed partial class TestJsonContext : JsonSerializerContext;

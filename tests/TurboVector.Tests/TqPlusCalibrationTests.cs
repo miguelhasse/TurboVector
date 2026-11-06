@@ -41,6 +41,53 @@ public class TqPlusCalibrationTests
         Assert.All(results.Indices, id => Assert.InRange(id, 0, index.Len - 1));
     }
 
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void RecalibrationMatchesIndependentRowsAcrossChunkBoundaries(int bitWidth)
+    {
+        const int dim = 64;
+        const int firstCount = 4096;
+        const int secondCount = 7;
+        float[] vectors = TestHelpers.MakeVectors(firstCount + secondCount, dim, seed: 121);
+        float[] firstSample = TestHelpers.MakeVectors(128, dim, seed: 122);
+        float[] secondSample = TestHelpers.MakeVectors(128, dim, seed: 123);
+        var all = new TurboQuantIndex(dim, bitWidth);
+        var first = new TurboQuantIndex(dim, bitWidth);
+        var second = new TurboQuantIndex(dim, bitWidth);
+        all.Calibrate(firstSample);
+        first.Calibrate(firstSample);
+        second.Calibrate(firstSample);
+        all.Add(vectors);
+        first.Add(vectors.AsSpan(0, firstCount * dim));
+        second.Add(vectors.AsSpan(firstCount * dim));
+
+        all.Calibrate(secondSample);
+        first.Calibrate(secondSample);
+        second.Calibrate(secondSample);
+
+        Assert.Equal(first.PackedCodes.ToArray().Concat(second.PackedCodes.ToArray()), all.PackedCodes.ToArray());
+        Assert.Equal(first.Scales.ToArray().Concat(second.Scales.ToArray()), all.Scales.ToArray());
+    }
+
+    [Fact]
+    public void RecalibrationBoundsTemporaryAllocationsForLargeIndexes()
+    {
+        const int dim = 512;
+        const int rows = 16_384;
+        var index = new TurboQuantIndex(dim, 4);
+        index.Add(TestHelpers.MakeVectors(rows, dim, seed: 124));
+        float[] sample = TestHelpers.MakeVectors(128, dim, seed: 125);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        index.Calibrate(sample);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(allocated < 32L * 1024 * 1024, $"Recalibration allocated {allocated:N0} bytes.");
+        Assert.Equal(rows, index.Len);
+    }
+
     [Fact]
     public void CalibratedIndexPersistsCalibrationAndPackedData()
     {

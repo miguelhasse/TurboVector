@@ -25,6 +25,22 @@ public class LazyInitTests
     }
 
     [Fact]
+    public void InvalidFirstAddDoesNotCommitDimension()
+    {
+        var idx = TurboQuantIndex.NewLazy(4);
+        float[] invalid = new float[Dim];
+        invalid[0] = float.NaN;
+
+        Assert.Throws<ArgumentException>(() => idx.Add2D(invalid, Dim));
+        Assert.Null(idx.DimOpt);
+        Assert.Equal(0, idx.Len);
+
+        idx.Add2D(TestHelpers.UnitSphereVectors(1, Dim * 2, 0xA00D_0020UL), Dim * 2);
+        Assert.Equal(Dim * 2, idx.Dim);
+        Assert.Equal(1, idx.Len);
+    }
+
+    [Fact]
     public void Add2DSubsequentCallsMustMatchDim()
     {
         var idx = TurboQuantIndex.NewLazy(4);
@@ -147,6 +163,23 @@ public class LazyInitTests
         Assert.Equal(Dim, idx.DimOpt);
         Assert.Equal(3, idx.Len);
         Assert.True(idx.Contains(20UL));
+    }
+
+    [Fact]
+    public void IdMapInvalidFirstAddDoesNotCommitDimension()
+    {
+        var idx = IdMapIndex.NewLazy(4);
+        float[] invalid = new float[Dim];
+        invalid[0] = float.NaN;
+
+        Assert.Throws<ArgumentException>(() => idx.AddWithIds2D(invalid, Dim, [1UL]));
+        Assert.Null(idx.DimOpt);
+        Assert.Equal(0, idx.Len);
+        Assert.False(idx.Contains(1UL));
+
+        idx.AddWithIds2D(TestHelpers.UnitSphereVectors(1, Dim * 2, 0xA00D_0021UL), Dim * 2, [2UL]);
+        Assert.Equal(Dim * 2, idx.Dim);
+        Assert.True(idx.Contains(2UL));
     }
 
     [Fact]

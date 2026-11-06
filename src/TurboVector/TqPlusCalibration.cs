@@ -24,7 +24,7 @@ internal static class TqPlusCalibration
             ReadOnlySpan<float> source = sample.Slice(row * dim, dim);
             float norm = Encoder.ComputeNorm(source);
             float inverseNorm = norm > 1e-10f ? 1.0f / norm : 0.0f;
-            rotation.ApplyScaledInto(source, inverseNorm, rotated.AsSpan(row * dim, dim), scratch);
+            rotation.ApplyScaledIntoUnchecked(source, inverseNorm, rotated.AsSpan(row * dim, dim), scratch);
         }
 
         float outerCentroid = 0.0f;

@@ -205,7 +205,7 @@ public static class Encoder
                 float norm = ComputeNorm(source);
                 scalesDest[i] = norm;
                 float inverseNorm = norm > 1e-10f ? 1.0f / norm : 0.0f;
-                rotation.ApplyScaledInto(source, inverseNorm, rotated.AsSpan(rowStart, dim), scratch.AsSpan(0, dim));
+                rotation.ApplyScaledIntoUnchecked(source, inverseNorm, rotated.AsSpan(rowStart, dim), scratch.AsSpan(0, dim));
             }
 
             EncodePrerotatedInto(

@@ -214,18 +214,23 @@ internal sealed class TypedRecordAccessor<TKey, TRecord> : RecordAccessor<TKey, 
     where TRecord : class
 {
     private readonly TurboQuantRecordMapping<TKey, TRecord> _mapping;
-    private readonly string _vectorJsonName;
+    private readonly JsonPropertyInfo _vectorJsonProperty;
+    private readonly Lazy<JsonTypeInfo>? _emptyVectorTypeInfo;
 
     public TypedRecordAccessor(TurboQuantRecordMapping<TKey, TRecord> mapping, VectorStoreCollectionDefinition? definition)
         : this(mapping, Create(mapping, definition ?? mapping.Definition))
     {
     }
 
-    private TypedRecordAccessor(TurboQuantRecordMapping<TKey, TRecord> mapping, (CollectionSchema Schema, string VectorJsonName) created)
+    private TypedRecordAccessor(TurboQuantRecordMapping<TKey, TRecord> mapping, (CollectionSchema Schema, JsonPropertyInfo VectorJsonProperty) created)
         : base(created.Schema)
     {
         _mapping = mapping;
-        _vectorJsonName = created.VectorJsonName;
+        _vectorJsonProperty = created.VectorJsonProperty;
+        if (_vectorJsonProperty.IsRequired || mapping.RecordTypeInfo.Options.RespectRequiredConstructorParameters)
+        {
+            _emptyVectorTypeInfo = new Lazy<JsonTypeInfo>(CreateEmptyVectorTypeInfo);
+        }
     }
 
     public override string SerializeKey(TKey key) => JsonSerializer.Serialize(key, _mapping.KeyTypeInfo);
@@ -265,7 +270,14 @@ internal sealed class TypedRecordAccessor<TKey, TRecord> : RecordAccessor<TKey, 
             JsonNode? node = JsonNode.Parse(json);
             if (node is JsonObject obj)
             {
-                obj.Remove(_vectorJsonName);
+                if (_vectorJsonProperty.IsRequired || _mapping.RecordTypeInfo.Options.RespectRequiredConstructorParameters)
+                {
+                    obj[_vectorJsonProperty.Name] = EmptyVectorJson();
+                }
+                else
+                {
+                    obj.Remove(_vectorJsonProperty.Name);
+                }
             }
 
             record = node.Deserialize(_mapping.RecordTypeInfo);
@@ -274,7 +286,93 @@ internal sealed class TypedRecordAccessor<TKey, TRecord> : RecordAccessor<TKey, 
         return record ?? throw new InvalidDataException("A persisted record deserialized to null.");
     }
 
-    private static (CollectionSchema Schema, string VectorJsonName) Create(
+    private static object? EmptyVectorValue(Type type)
+    {
+        if (type == typeof(ReadOnlyMemory<float>))
+        {
+            return ReadOnlyMemory<float>.Empty;
+        }
+
+        if (type == typeof(Memory<float>))
+        {
+            return Memory<float>.Empty;
+        }
+
+        return type.IsAssignableFrom(typeof(float[])) ? Array.Empty<float>() : null;
+    }
+
+    private JsonNode? EmptyVectorJson()
+    {
+        JsonTypeInfo typeInfo = _emptyVectorTypeInfo!.Value;
+        Type type = _vectorJsonProperty.PropertyType;
+        Func<object?>? createEmptyVector = _mapping.CreateEmptyVector;
+        object? empty = createEmptyVector is null ? EmptyVectorValue(type) : createEmptyVector();
+        if (empty is null && createEmptyVector is null && Nullable.GetUnderlyingType(type) is null)
+        {
+            try
+            {
+                empty = typeInfo.CreateObject?.Invoke() ?? JsonSerializer.Deserialize("[]", typeInfo);
+            }
+            catch (JsonException error)
+            {
+                throw new NotSupportedException(
+                    $"The required vector property '{_vectorJsonProperty.Name}' cannot be created empty from its JSON metadata. " +
+                    $"Set {nameof(TurboQuantRecordMapping<TKey, TRecord>.CreateEmptyVector)} on the record mapping.", error);
+            }
+
+            if (empty is null)
+            {
+                throw new NotSupportedException(
+                    $"The required vector property '{_vectorJsonProperty.Name}' cannot be created empty from its JSON metadata. " +
+                    $"Set {nameof(TurboQuantRecordMapping<TKey, TRecord>.CreateEmptyVector)} on the record mapping.");
+            }
+        }
+
+        if (empty is not null && (!type.IsInstanceOfType(empty) || !IsEmptyVector(empty)))
+        {
+            throw new InvalidOperationException(
+                $"The empty value for vector property '{_vectorJsonProperty.Name}' must be an empty '{type}'.");
+        }
+
+        return JsonSerializer.SerializeToNode(empty, typeInfo);
+    }
+
+    private static bool IsEmptyVector(object value)
+    {
+        switch (value)
+        {
+            case ReadOnlyMemory<float> readOnlyMemory:
+                return readOnlyMemory.IsEmpty;
+            case Memory<float> memory:
+                return memory.IsEmpty;
+            case ICollection<float> collection:
+                return collection.Count == 0;
+            case IReadOnlyCollection<float> collection:
+                return collection.Count == 0;
+            case IEnumerable<float> sequence:
+                using (IEnumerator<float> enumerator = sequence.GetEnumerator())
+                {
+                    return !enumerator.MoveNext();
+                }
+            default:
+                return false;
+        }
+    }
+
+    private JsonTypeInfo CreateEmptyVectorTypeInfo()
+    {
+        JsonSerializerOptions options = _mapping.RecordTypeInfo.Options;
+        if (_vectorJsonProperty.CustomConverter is { } converter)
+        {
+            options = new JsonSerializerOptions(options);
+            options.Converters.Insert(0, converter);
+            options.MakeReadOnly();
+        }
+
+        return options.GetTypeInfo(_vectorJsonProperty.PropertyType);
+    }
+
+    private static (CollectionSchema Schema, JsonPropertyInfo VectorJsonProperty) Create(
         TurboQuantRecordMapping<TKey, TRecord> mapping,
         VectorStoreCollectionDefinition definition)
     {
@@ -304,7 +402,7 @@ internal sealed class TypedRecordAccessor<TKey, TRecord> : RecordAccessor<TKey, 
             string storageName = property.StorageName
                 ?? recordInfo.Options.PropertyNamingPolicy?.ConvertName(property.Name)
                 ?? property.Name;
-            if (!HasJsonProperty(recordInfo, storageName))
+            if (FindJsonProperty(recordInfo, storageName) is null)
             {
                 throw new InvalidOperationException(
                     $"Property '{property.Name}' maps to JSON property '{storageName}', which is not present in the metadata for '{typeof(TRecord)}'. " +
@@ -315,20 +413,21 @@ internal sealed class TypedRecordAccessor<TKey, TRecord> : RecordAccessor<TKey, 
         }
 
         var schema = new CollectionSchema(model, property => storageNames[property.ModelName]);
-        return (schema, storageNames[model.VectorProperty.ModelName]);
+        JsonPropertyInfo vectorJsonProperty = FindJsonProperty(recordInfo, storageNames[model.VectorProperty.ModelName])!;
+        return (schema, vectorJsonProperty);
     }
 
-    private static bool HasJsonProperty(JsonTypeInfo typeInfo, string name)
+    private static JsonPropertyInfo? FindJsonProperty(JsonTypeInfo typeInfo, string name)
     {
         foreach (JsonPropertyInfo property in typeInfo.Properties)
         {
             if (string.Equals(property.Name, name, StringComparison.Ordinal))
             {
-                return true;
+                return property;
             }
         }
 
-        return false;
+        return null;
     }
 }
 
@@ -337,6 +436,8 @@ internal sealed class DynamicRecordAccessor : RecordAccessor<object, Dictionary<
     private readonly JsonSerializerOptions _options;
     private readonly JsonTypeInfo<Dictionary<string, object?>> _recordInfo;
     private readonly JsonTypeInfo[] _propertyInfos;
+    private readonly Dictionary<string, int>? _propertyIndicesByJsonName;
+    private readonly HashSet<string>? _modelNames;
 
     public DynamicRecordAccessor(VectorStoreCollectionDefinition definition, JsonSerializerOptions options)
         : base(Create(definition, options))
@@ -345,6 +446,12 @@ internal sealed class DynamicRecordAccessor : RecordAccessor<object, Dictionary<
         _recordInfo = (JsonTypeInfo<Dictionary<string, object?>>)options.GetTypeInfo(typeof(Dictionary<string, object?>));
         IReadOnlyList<PropertyModel> properties = Schema.Model.Properties;
         _propertyInfos = new JsonTypeInfo[properties.Count];
+        if (options.DictionaryKeyPolicy is not null)
+        {
+            _propertyIndicesByJsonName = new Dictionary<string, int>(properties.Count, StringComparer.Ordinal);
+            _modelNames = new HashSet<string>(properties.Count, StringComparer.Ordinal);
+        }
+
         for (int i = 0; i < properties.Count; i++)
         {
             if (!options.TryGetTypeInfo(properties[i].Type, out JsonTypeInfo? typeInfo))
@@ -355,6 +462,17 @@ internal sealed class DynamicRecordAccessor : RecordAccessor<object, Dictionary<
             }
 
             _propertyInfos[i] = typeInfo;
+            if (options.DictionaryKeyPolicy is { } policy)
+            {
+                string jsonName = policy.ConvertName(properties[i].ModelName)
+                    ?? throw new InvalidOperationException("The dictionary key policy returned a null property name.");
+                if (!_propertyIndicesByJsonName!.TryAdd(jsonName, i))
+                {
+                    throw new InvalidOperationException($"The dictionary key policy maps multiple properties to '{jsonName}'.");
+                }
+
+                _modelNames!.Add(properties[i].ModelName);
+            }
         }
     }
 
@@ -381,13 +499,65 @@ internal sealed class DynamicRecordAccessor : RecordAccessor<object, Dictionary<
     public override ReadOnlyMemory<float> GetVector(Dictionary<string, object?> record)
         => VectorValues.ToMemory(Schema.VectorProperty.GetValueAsObject(record), Schema.VectorProperty.ModelName);
 
-    public override string Serialize(Dictionary<string, object?> record) => JsonSerializer.Serialize(record, _recordInfo);
+    public override string Serialize(Dictionary<string, object?> record)
+    {
+        if (_options.DictionaryKeyPolicy is { } policy)
+        {
+            var jsonNames = new HashSet<string>(record.Count, StringComparer.Ordinal);
+            IReadOnlyList<PropertyModel> properties = Schema.Model.Properties;
+            foreach (string modelName in record.Keys)
+            {
+                string jsonName = policy.ConvertName(modelName)
+                    ?? throw new InvalidOperationException("The dictionary key policy returned a null property name.");
+                bool conflictsWithModelName = _propertyIndicesByJsonName!.TryGetValue(jsonName, out int index)
+                    ? !string.Equals(properties[index].ModelName, modelName, StringComparison.Ordinal)
+                    : _modelNames!.Contains(jsonName);
+                if (!jsonNames.Add(jsonName) || conflictsWithModelName)
+                {
+                    throw new ArgumentException($"The dictionary key policy creates an ambiguous property name '{jsonName}'.", nameof(record));
+                }
+            }
+        }
+
+        return JsonSerializer.Serialize(record, _recordInfo);
+    }
 
     public override Dictionary<string, object?> Deserialize(string json, bool includeVectors)
     {
         Dictionary<string, object?> record = JsonSerializer.Deserialize(json, _recordInfo)
             ?? throw new InvalidDataException("A persisted record deserialized to null.");
         IReadOnlyList<PropertyModel> properties = Schema.Model.Properties;
+        if (_propertyIndicesByJsonName is not null)
+        {
+            var normalized = new Dictionary<string, object?>(record.Count, StringComparer.Ordinal);
+            foreach ((string jsonName, object? value) in record)
+            {
+                string modelName = jsonName;
+                object? converted = value;
+                if (_propertyIndicesByJsonName.TryGetValue(jsonName, out int index))
+                {
+                    PropertyModel property = properties[index];
+                    if (!includeVectors && property is VectorPropertyModel)
+                    {
+                        continue;
+                    }
+
+                    modelName = property.ModelName;
+                    if (value is JsonElement element)
+                    {
+                        converted = element.Deserialize(_propertyInfos[index]);
+                    }
+                }
+
+                if (!normalized.TryAdd(modelName, converted))
+                {
+                    throw new InvalidDataException($"The persisted record contains an ambiguous property name '{modelName}'.");
+                }
+            }
+
+            return normalized;
+        }
+
         for (int i = 0; i < properties.Count; i++)
         {
             PropertyModel property = properties[i];

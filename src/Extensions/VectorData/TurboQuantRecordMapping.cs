@@ -32,6 +32,12 @@ public sealed class TurboQuantRecordMapping<TKey, TRecord>
     /// <summary>Gets the accessor returning the record vector.</summary>
     public required Func<TRecord, ReadOnlyMemory<float>> GetVector { get; init; }
 
+    /// <summary>
+    /// Optionally creates an empty value of the declared vector-property type for required
+    /// properties when vectors are excluded. Return null only for a nullable property.
+    /// </summary>
+    public Func<object?>? CreateEmptyVector { get; init; }
+
     /// <summary>Gets the optional key setter used to assign auto-generated <see cref="Guid"/> keys.</summary>
     public Action<TRecord, TKey>? SetKey { get; init; }
 }

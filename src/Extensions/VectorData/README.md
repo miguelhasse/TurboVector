@@ -66,9 +66,10 @@ internal static class ArticleMapping
 ```
 
 - `SetKey` is optional; supply it for `Guid` keys so `UpsertAsync` can assign generated keys.
+- Required vector properties are returned empty when vectors are excluded. For a custom vector type or converter that cannot deserialize an empty JSON array, set `CreateEmptyVector` to a factory returning an empty value of the declared vector type.
 - If a property's JSON name differs from the name produced by the record metadata's naming policy (for example via `[JsonPropertyName]`), set `StorageName` on the definition property. Mappings are validated against the `JsonTypeInfo` when a collection is created.
 - To use the standard `VectorStore.GetCollection<TKey, TRecord>(name)` API, register the mapping once: `store.RegisterRecordMapping(ArticleMapping.Instance)`. That API is annotated as requiring dynamic code by Microsoft.Extensions.VectorData itself, so AOT applications should prefer the `GetCollection(name, mapping)` overload. Unregistered record types throw `InvalidOperationException`.
-- `GetDynamicCollection(name, definition)` is AOT-safe. Common scalar, vector and collection types have built-in JSON metadata. Supply metadata for other property types through the `serializerOptions` constructor argument (for example `new JsonSerializerOptions { TypeInfoResolver = MyJsonContext.Default }`).
+- `GetDynamicCollection(name, definition)` is AOT-safe. Common scalar, vector and collection types have built-in JSON metadata. Supply metadata for other property types through the `serializerOptions` constructor argument (for example `new JsonSerializerOptions { TypeInfoResolver = MyJsonContext.Default }`). A configured dictionary key policy is reversed for declared properties when reading records; policies or record keys that produce ambiguous names are rejected.
 
 The vector property must use a supported float vector type (`ReadOnlyMemory<float>`, `Memory<float>`, `float[]`, or an `IEnumerable<float>` implementation). TurboVector requires dimensions to be positive multiples of 8 (at most 16384); unsupported declared dimensions are rejected when the collection is created. This provider stores precomputed vectors and does not generate embeddings from text.
 

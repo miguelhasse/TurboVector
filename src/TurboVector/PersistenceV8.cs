@@ -31,6 +31,59 @@ internal static class PersistenceV8
     private const byte PlanesLayout = 1;
     private const float MaxVectorScale = 1e22f;
 
+    private static SyncTargetLock LockSyncTarget(string path)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        string fullPath = Path.GetFullPath(path);
+        if (OperatingSystem.IsWindows())
+        {
+            fullPath = fullPath.ToUpperInvariant();
+        }
+
+        byte[] hash = SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(fullPath));
+        string name = "TurboVector-" + Convert.ToHexString(hash);
+        var options = new NamedWaitHandleOptions
+        {
+            CurrentSessionOnly = false,
+            CurrentUserOnly = true
+        };
+        var mutex = new Mutex(initiallyOwned: false, name, options);
+        try
+        {
+            try
+            {
+                mutex.WaitOne();
+            }
+            catch (AbandonedMutexException error)
+            {
+                mutex.ReleaseMutex();
+                throw new IOException($"The writer lock for '{path}' was abandoned. Retry after inspecting the file.", error);
+            }
+
+            return new SyncTargetLock(mutex);
+        }
+        catch
+        {
+            mutex.Dispose();
+            throw;
+        }
+    }
+
+    private sealed class SyncTargetLock(Mutex mutex) : IDisposable
+    {
+        public void Dispose()
+        {
+            try
+            {
+                mutex.ReleaseMutex();
+            }
+            finally
+            {
+                mutex.Dispose();
+            }
+        }
+    }
+
     internal static byte[] ToBytes(
         int kind,
         int bitWidth,
@@ -90,6 +143,25 @@ internal static class PersistenceV8
         Durability durability,
         ulong nonce = 0)
     {
+        using SyncTargetLock targetLock = LockSyncTarget(path);
+        WriteFileCore(path, kind, bitWidth, dim, nVectors, packedCodes, scales, ids,
+            tqPlusShift, tqPlusScale, durability, nonce);
+    }
+
+    private static void WriteFileCore(
+        string path,
+        int kind,
+        int bitWidth,
+        int dim,
+        int nVectors,
+        ReadOnlySpan<byte> packedCodes,
+        ReadOnlySpan<float> scales,
+        ReadOnlySpan<ulong> ids,
+        ReadOnlySpan<float> tqPlusShift,
+        ReadOnlySpan<float> tqPlusScale,
+        Durability durability,
+        ulong nonce)
+    {
         ArgumentException.ThrowIfNullOrEmpty(path);
         Validate(kind, bitWidth, dim, nVectors, packedCodes, scales, ids, tqPlusShift, tqPlusScale);
         if (durability is not (Durability.Durable or Durability.Fast))
@@ -142,8 +214,15 @@ internal static class PersistenceV8
         ReadOnlySpan<float> scales,
         ReadOnlySpan<ulong> ids,
         ReadOnlySpan<float> tqPlusShift,
-        ReadOnlySpan<float> tqPlusScale)
+        ReadOnlySpan<float> tqPlusScale,
+        SyncCursor? expectedCursor)
     {
+        using SyncTargetLock targetLock = LockSyncTarget(path);
+        if (expectedCursor is SyncCursor cursor)
+        {
+            VerifySyncCursor(path, kind, bitWidth, dim, cursor);
+        }
+
         Span<byte> nonceBytes = stackalloc byte[sizeof(ulong)];
         ulong nonce;
         do
@@ -153,12 +232,12 @@ internal static class PersistenceV8
         }
         while (nonce == 0);
 
-        WriteFile(path, kind, bitWidth, dim, nVectors, packedCodes, scales, ids,
+        WriteFileCore(path, kind, bitWidth, dim, nVectors, packedCodes, scales, ids,
             tqPlusShift, tqPlusScale, Durability.Durable, nonce);
         return new SyncCursor(nonce, 0, nVectors);
     }
 
-    internal static void VerifySyncCursor(
+    private static void VerifySyncCursor(
         string path,
         int kind,
         int bitWidth,
@@ -188,6 +267,7 @@ internal static class PersistenceV8
         SyncCursor cursor)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
+        using SyncTargetLock targetLock = LockSyncTarget(path);
         if (newCount < oldCount)
         {
             throw new InvalidOperationException("Incremental sync only supports append-only changes.");

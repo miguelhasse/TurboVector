@@ -66,7 +66,7 @@ public sealed class Rotation
     /// <summary>The vector dimensionality this rotation is built for.</summary>
     public int Dim => _dim;
 
-    /// <summary>Rotate one vector in place, using caller-provided scratch.</summary>
+    /// <summary>Rotate one vector in place, using scratch that does not overlap the vector.</summary>
     public void Apply(Span<float> row, Span<float> scratch)
     {
         ValidateBuffers(row, scratch);
@@ -76,7 +76,8 @@ public sealed class Rotation
 
     /// <summary>
     /// Rotate a normalized vector directly into a destination. The source is
-    /// left unchanged and the input scaling is fused into the first gather.
+    /// left unchanged unless it overlaps the destination. Scratch must not
+    /// overlap either span. The input scaling is fused into the first gather.
     /// </summary>
     public void ApplyScaledInto(
         ReadOnlySpan<float> source,
@@ -89,6 +90,20 @@ public sealed class Rotation
             throw new ArgumentException("Source, destination, and scratch lengths must equal the rotation dimension.");
         }
 
+        if (source.Overlaps(scratch) || destination.Overlaps(scratch))
+        {
+            throw new ArgumentException("Scratch must not overlap the source or destination.", nameof(scratch));
+        }
+
+        ApplyScaledIntoUnchecked(source, inverseNorm, destination, scratch);
+    }
+
+    internal void ApplyScaledIntoUnchecked(
+        ReadOnlySpan<float> source,
+        float inverseNorm,
+        Span<float> destination,
+        Span<float> scratch)
+    {
         ApplyRound(source, scratch, 0, inverseNorm, scaled: true);
         ApplyRound(scratch, destination, 1, 1.0f, scaled: false);
     }
@@ -125,6 +140,11 @@ public sealed class Rotation
         if (row.Length != _dim || scratch.Length != _dim)
         {
             throw new ArgumentException("Row and scratch lengths must equal the rotation dimension.");
+        }
+
+        if (row.Overlaps(scratch))
+        {
+            throw new ArgumentException("Scratch must not overlap the row.", nameof(scratch));
         }
     }
 

@@ -1,5 +1,6 @@
 using Hasseware.Extensions.VectorData.TurboQuant;
 using Microsoft.Extensions.VectorData;
+using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -50,6 +51,23 @@ internal static class Program
         Require(index.TqPlusScale.SequenceEqual(restored.TqPlusScale), "Core persistence changed calibration scales.");
         Require(before.Indices.AsSpan().SequenceEqual(after.Indices), "Core persistence changed search results.");
         Require(before.Scores.AsSpan().SequenceEqual(after.Scores), "Core persistence changed search scores.");
+
+        string path = Path.Combine(Path.GetTempPath(), $"turbovector-aot-{Guid.NewGuid():N}.tv");
+        try
+        {
+            index.Sync(path);
+            index.Add(vectors.AsSpan(0, dimension));
+            index.Sync(path);
+            index.SwapRemove(0);
+            index.Sync(path);
+            TurboQuantIndex synced = TurboQuantIndex.Load(path);
+            Require(index.PackedCodes.SequenceEqual(synced.PackedCodes), "Sync changed quantized codes.");
+            Require(index.Scales.SequenceEqual(synced.Scales), "Sync changed quantization scales.");
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 
     private static async Task CheckProviderAsync()
@@ -57,7 +75,11 @@ internal static class Program
         string directory = Path.Combine(Path.GetTempPath(), $"turbovector-aot-{Guid.NewGuid():N}");
         try
         {
-            var options = new JsonSerializerOptions { TypeInfoResolver = SmokeJsonContext.Default };
+            var options = new JsonSerializerOptions
+            {
+                TypeInfoResolver = SmokeJsonContext.Default,
+                DictionaryKeyPolicy = JsonNamingPolicy.CamelCase
+            };
             var store = new TurboQuantFileSystemVectorStore(directory, serializerOptions: options);
             var mapping = new TurboQuantRecordMapping<string, SmokeDocument>
             {
@@ -90,6 +112,28 @@ internal static class Program
             SmokeDocument? withoutVector = await documents.GetAsync("b");
             Require(withoutVector is not null && withoutVector.Category == "guide" && withoutVector.Embedding.IsEmpty,
                 "Typed record retrieval without vectors failed.");
+
+            var immutableMapping = new TurboQuantRecordMapping<string, SmokeImmutableDocument>
+            {
+                Definition = new VectorStoreCollectionDefinition
+                {
+                    Properties =
+                    [
+                        new VectorStoreKeyProperty(nameof(SmokeImmutableDocument.Id), typeof(string)),
+                        new VectorStoreVectorProperty(nameof(SmokeImmutableDocument.Embedding), typeof(ImmutableArray<float>), 8)
+                    ]
+                },
+                RecordTypeInfo = SmokeJsonContext.Default.SmokeImmutableDocument,
+                KeyTypeInfo = SmokeJsonContext.Default.String,
+                GetKey = static document => document.Id,
+                GetVector = static document => document.Embedding.ToArray()
+            };
+            TurboQuantCollection<string, SmokeImmutableDocument> immutable = store.GetCollection("immutable", immutableMapping);
+            await immutable.UpsertAsync(new SmokeImmutableDocument { Id = "a", Embedding = [.. first] });
+            SmokeImmutableDocument? withoutImmutableVector = await immutable.GetAsync("a");
+            Require(withoutImmutableVector is not null && withoutImmutableVector.Embedding.IsEmpty,
+                "Required immutable vector retrieval without vectors failed.");
+            await immutable.EnsureCollectionDeletedAsync();
 
             var typedResults = new List<VectorSearchResult<SmokeDocument>>();
             await foreach (VectorSearchResult<SmokeDocument> result in documents.SearchAsync(
@@ -240,7 +284,7 @@ internal sealed class SmokeDocument
 
     public int Rank { get; set; }
 
-    public ReadOnlyMemory<float> Embedding { get; set; }
+    public required ReadOnlyMemory<float> Embedding { get; init; }
 }
 
 internal sealed class SmokeDetails
@@ -248,7 +292,15 @@ internal sealed class SmokeDetails
     public string Title { get; set; } = "";
 }
 
+internal sealed class SmokeImmutableDocument
+{
+    public required string Id { get; init; }
+
+    public required ImmutableArray<float> Embedding { get; init; }
+}
+
 [JsonSerializable(typeof(SmokeDocument))]
 [JsonSerializable(typeof(SmokeDetails))]
+[JsonSerializable(typeof(SmokeImmutableDocument))]
 [JsonSerializable(typeof(string))]
 internal sealed partial class SmokeJsonContext : JsonSerializerContext;

@@ -167,15 +167,23 @@ public sealed class TurboQuantIndex
     {
         int dim = _dim ?? throw new InvalidOperationException("dim is not set. Use Add2D on a lazy index to commit the dimension first.");
         EnsureInitialized();
+        AddCore(vectors, dim, _rotation!, _codebook!);
+    }
 
+    private void AddCore(
+        ReadOnlySpan<float> vectors,
+        int dim,
+        Lazy<Rotation> rotationLazy,
+        Lazy<(float[] Boundaries, float[] Centroids)> codebookLazy)
+    {
         if (vectors.Length % dim != 0)
         {
             throw new ArgumentException("vectors length must be divisible by dim.", nameof(vectors));
         }
 
         int n = vectors.Length / dim;
-        var rotation = _rotation!.Value;
-        var (boundaries, centroids) = _codebook!.Value;
+        var rotation = rotationLazy.Value;
+        var (boundaries, centroids) = codebookLazy.Value;
 
         int batchPackedLen = checked(n * (dim / 8) * _bitWidth);
         int newPackedLength = _packedLength + batchPackedLen;
@@ -211,8 +219,13 @@ public sealed class TurboQuantIndex
         if (_dim is null)
         {
             ValidateDim(dim);
+            Lazy<Rotation> rotation = MakeRotationLazy(dim);
+            Lazy<(float[] Boundaries, float[] Centroids)> codebook = MakeCodebookLazy(_bitWidth, dim);
+            AddCore(vectors, dim, rotation, codebook);
             _dim = dim;
-            InitializeLazies(dim);
+            _rotation = rotation;
+            _codebook = codebook;
+            return;
         }
         else if (_dim.Value != dim)
         {
@@ -263,43 +276,69 @@ public sealed class TurboQuantIndex
         {
             reencoded = new byte[_packedLength];
             reencodedScales = new float[_nVectors];
-            byte[] codes = Pack.ExtractCodes(
-                new ReadOnlySpan<byte>(_packedCodes, 0, _packedLength), _nVectors, _bitWidth, dim);
-            float[] reconstructed = new float[checked(_nVectors * dim)];
-            float[] norms = new float[_nVectors];
             float[] inverseOldScale = new float[dim];
             for (int d = 0; d < dim; d++)
             {
                 inverseOldScale[d] = _tqplusScale.Length == 0 ? 1.0f : 1.0f / _tqplusScale[d];
             }
 
-            for (int row = 0; row < _nVectors; row++)
+            const int MaxChunkRows = 4096;
+            const int MaxChunkCoordinates = 2 * 1024 * 1024;
+            int chunkRows = Math.Min(_nVectors, Math.Min(MaxChunkRows, Math.Max(1, MaxChunkCoordinates / dim)));
+            int chunkCoordinates = checked(chunkRows * dim);
+            int bytesPerRow = checked(dim / 8 * _bitWidth);
+            float[]? reconstructed = null;
+            float[]? norms = null;
+            byte[]? codes = null;
+            try
             {
-                double sumSquares = 0.0;
-                int rowStart = row * dim;
-                for (int d = 0; d < dim; d++)
+                reconstructed = ArrayPool<float>.Shared.Rent(chunkCoordinates);
+                norms = ArrayPool<float>.Shared.Rent(chunkRows);
+                codes = ArrayPool<byte>.Shared.Rent(chunkCoordinates);
+                for (int start = 0; start < _nVectors; start += chunkRows)
                 {
-                    float oldShift = _tqplusShift.Length == 0 ? 0.0f : _tqplusShift[d];
-                    float value = centroids[codes[rowStart + d]] * inverseOldScale[d] - oldShift;
-                    reconstructed[rowStart + d] = value;
-                    sumSquares += (double)value * value;
+                    int count = Math.Min(chunkRows, _nVectors - start);
+                    int coordinates = checked(count * dim);
+                    int packedOffset = checked(start * bytesPerRow);
+                    int packedLength = checked(count * bytesPerRow);
+                    Pack.ExtractCodes(
+                        _packedCodes.AsSpan(packedOffset, packedLength),
+                        count, _bitWidth, dim, codes.AsSpan(0, coordinates));
+                    for (int row = 0; row < count; row++)
+                    {
+                        double sumSquares = 0.0;
+                        int rowStart = row * dim;
+                        for (int d = 0; d < dim; d++)
+                        {
+                            float oldShift = _tqplusShift.Length == 0 ? 0.0f : _tqplusShift[d];
+                            float value = centroids[codes[rowStart + d]] * inverseOldScale[d] - oldShift;
+                            reconstructed[rowStart + d] = value;
+                            sumSquares += (double)value * value;
+                        }
+
+                        norms[row] = (float)((double)_scales[start + row] * sumSquares);
+                    }
+
+                    Encoder.EncodePrerotatedInto(
+                        reconstructed.AsSpan(0, coordinates),
+                        norms.AsSpan(0, count),
+                        count,
+                        dim,
+                        boundaries,
+                        centroids,
+                        shift,
+                        scale,
+                        _bitWidth,
+                        reencoded.AsSpan(packedOffset, packedLength),
+                        reencodedScales.AsSpan(start, count));
                 }
-
-                norms[row] = (float)((double)_scales[row] * sumSquares);
             }
-
-            Encoder.EncodePrerotatedInto(
-                reconstructed,
-                norms,
-                _nVectors,
-                dim,
-                boundaries,
-                centroids,
-                shift,
-                scale,
-                _bitWidth,
-                reencoded,
-                reencodedScales);
+            finally
+            {
+                if (codes is not null) ArrayPool<byte>.Shared.Return(codes);
+                if (norms is not null) ArrayPool<float>.Shared.Return(norms);
+                if (reconstructed is not null) ArrayPool<float>.Shared.Return(reconstructed);
+            }
         }
 
         if (_dim is null)
@@ -467,8 +506,8 @@ public sealed class TurboQuantIndex
     /// <summary>
     /// Durably commits this index to a v8 file. New complete 32-row units are
     /// appended when the existing sync cursor is current; other changes use
-    /// an atomic full rewrite. A path already bound by a prior Sync or Load
-    /// is protected against replacement or advancement by another writer.
+    /// an atomic full rewrite. Writers using TurboVector as the same user on
+    /// the same host and normalized path coordinate to detect a stale cursor.
     /// </summary>
     public void Sync(string path)
     {
@@ -556,15 +595,13 @@ public sealed class TurboQuantIndex
                     _syncAppendCompatible = true;
                     return;
                 }
-
-                PersistenceV8.VerifySyncCursor(fullPath, kind, _bitWidth, dim, cursor);
             }
 
             SyncCursor written = PersistenceV8.WriteSyncFile(
                 fullPath, kind, _bitWidth, dim, _nVectors,
                 new ReadOnlySpan<byte>(_packedCodes, 0, _packedLength),
                 new ReadOnlySpan<float>(_scales, 0, _nVectors), ids,
-                _tqplusShift, _tqplusScale);
+                _tqplusShift, _tqplusScale, sameTarget ? _syncCursor : null);
             _syncPath = fullPath;
             _syncCursor = written;
             _syncAppendOnly = true;
