@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="benchmarks/TurboVector.Benchmarks/TurboVector.Benchmarks.csproj" />
+  <Project Path="examples/TurboVector.Examples/TurboVector.Examples.csproj" />
+  <Project Path="src/TurboVector/TurboVector.csproj" />
+  <Project Path="tests/TurboVector.Tests/TurboVector.Tests.csproj" />
+</Solution>
