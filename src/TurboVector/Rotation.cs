@@ -1,229 +1,249 @@
-using System.Buffers;
+using System.Numerics;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace TurboVector;
 
 /// <summary>
-/// Random orthogonal rotation matrix generation.
-/// Generates a deterministic orthogonal matrix via QR decomposition of
-/// a seeded Gaussian random matrix.
+/// Deterministic two-round globally-permuted block-Hadamard rotation.
 /// </summary>
-public static class Rotation
+public sealed class Rotation
 {
-    /// <summary>
-    /// Generate a dim x dim orthogonal matrix (deterministic, seeded).
-    /// Returns a row-major flat array of length dim * dim.
-    /// </summary>
-    public static float[] MakeRotationMatrix(int dim)
+    private const int Rounds = 2;
+    private static readonly byte[] Seed =
+    [
+        164, 143, 161, 123, 88, 50, 61, 10, 234, 184, 161, 204, 105, 1, 20, 184,
+        43, 140, 200, 117, 24, 180, 247, 84, 141, 68, 110, 161, 228, 223, 32, 242,
+    ];
+
+    private readonly int _dim;
+    private readonly int _blockSize;
+    private readonly float _inverseSqrtBlock;
+    private readonly int[][] _permutations;
+    private readonly float[][] _signs;
+
+    internal Rotation(int dim)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(dim);
+        InputValidation.ValidateDimension(dim, nameof(dim));
+        _dim = dim;
+        _blockSize = dim & -dim;
+        _inverseSqrtBlock = 1.0f / MathF.Sqrt(_blockSize);
 
-        int matrixSize = checked(dim * dim);
-        double[] a = ArrayPool<double>.Shared.Rent(matrixSize);
-        try
+        _permutations = new int[Rounds][];
+        _signs = new float[Rounds][];
+        var rng = new ChaCha8Rng(Seed);
+        for (int round = 0; round < Rounds; round++)
         {
-            var rng = new ChaCha8Rng(Constants.RotationSeed);
-            for (int i = 0; i < matrixSize; i++)
+            float[] signs = new float[dim];
+            for (int i = 0; i < dim; i++)
             {
-                a[i] = rng.NextStandardNormal();
+                signs[i] = (rng.NextUInt32() & 1) != 0 ? -1.0f : 1.0f;
             }
 
-            double[] q = HouseholderQR(a, dim);
-            try
+            int[] permutation = new int[dim];
+            for (int i = 0; i < dim; i++)
             {
-                float[] rotation = new float[matrixSize];
-                for (int i = 0; i < dim; i++)
-                {
-                    for (int j = 0; j < dim; j++)
-                    {
-                        rotation[(i * dim) + j] = (float)q[(j * dim) + i];
-                    }
-                }
+                permutation[i] = i;
+            }
 
-                return rotation;
-            }
-            finally
+            for (int i = dim - 1; i > 0; i--)
             {
-                ArrayPool<double>.Shared.Return(q);
+                int j = (int)(rng.NextUInt64() % (uint)(i + 1));
+                (permutation[i], permutation[j]) = (permutation[j], permutation[i]);
             }
-        }
-        finally
-        {
-            ArrayPool<double>.Shared.Return(a);
+
+            _signs[round] = signs;
+            _permutations[round] = permutation;
         }
     }
 
-    private static double[] HouseholderQR(double[] a, int dim)
+    /// <summary>
+    /// Create a rotation for the specified positive dimension, which must be
+    /// a multiple of eight and no greater than <see cref="Constants.MaxDim"/>.
+    /// </summary>
+    public static Rotation Create(int dim) => new(dim);
+
+    /// <summary>The vector dimensionality this rotation is built for.</summary>
+    public int Dim => _dim;
+
+    /// <summary>Rotate one vector in place, using caller-provided scratch.</summary>
+    public void Apply(Span<float> row, Span<float> scratch)
     {
-        int matrixSize = checked(dim * dim);
-        double[]? q = ArrayPool<double>.Shared.Rent(matrixSize);
-        double[]? v = null;
-        bool success = false;
-        try
+        ValidateBuffers(row, scratch);
+        ApplyRound(row, scratch, 0, 1.0f, scaled: false);
+        ApplyRound(scratch, row, 1, 1.0f, scaled: false);
+    }
+
+    /// <summary>
+    /// Rotate a normalized vector directly into a destination. The source is
+    /// left unchanged and the input scaling is fused into the first gather.
+    /// </summary>
+    public void ApplyScaledInto(
+        ReadOnlySpan<float> source,
+        float inverseNorm,
+        Span<float> destination,
+        Span<float> scratch)
+    {
+        if (source.Length != _dim || destination.Length != _dim || scratch.Length != _dim)
         {
-            Array.Clear(q, 0, matrixSize);
+            throw new ArgumentException("Source, destination, and scratch lengths must equal the rotation dimension.");
+        }
+
+        ApplyRound(source, scratch, 0, inverseNorm, scaled: true);
+        ApplyRound(scratch, destination, 1, 1.0f, scaled: false);
+    }
+
+    /// <summary>
+    /// Materialize the row-major dense matrix for callers that require one.
+    /// The index and encoder use <see cref="Apply"/> directly and do not
+    /// allocate this quadratic representation.
+    /// </summary>
+    public static float[] MakeRotationMatrix(int dim)
+    {
+        var rotation = new Rotation(dim);
+        int size = checked(dim * dim);
+        float[] matrix = new float[size];
+        float[] column = new float[dim];
+        float[] scratch = new float[dim];
+
+        for (int j = 0; j < dim; j++)
+        {
+            Array.Clear(column);
+            column[j] = 1.0f;
+            rotation.Apply(column, scratch);
             for (int i = 0; i < dim; i++)
             {
-                q[(i * dim) + i] = 1.0;
+                matrix[(i * dim) + j] = column[i];
             }
-
-            v = ArrayPool<double>.Shared.Rent(dim);
-
-            for (int k = 0; k < dim; k++)
-            {
-                double norm = 0.0;
-                for (int i = k; i < dim; i++)
-                {
-                    v[i] = a[(k * dim) + i];
-                    norm += v[i] * v[i];
-                }
-
-                norm = Math.Sqrt(norm);
-                if (norm < 1e-14)
-                {
-                    continue;
-                }
-
-                double sign = v[k] >= 0.0 ? 1.0 : -1.0;
-                v[k] += sign * norm;
-
-                double vv = 0.0;
-                for (int i = k; i < dim; i++)
-                {
-                    vv += v[i] * v[i];
-                }
-
-                if (vv < 1e-28)
-                {
-                    continue;
-                }
-
-                double beta = 2.0 / vv;
-
-                for (int j = k; j < dim; j++)
-                {
-                    double dot = 0.0;
-                    for (int i = k; i < dim; i++)
-                    {
-                        dot += v[i] * a[(j * dim) + i];
-                    }
-
-                    dot *= beta;
-                    for (int i = k; i < dim; i++)
-                    {
-                        a[(j * dim) + i] -= dot * v[i];
-                    }
-                }
-
-                for (int row = 0; row < dim; row++)
-                {
-                    double dot = 0.0;
-                    for (int i = k; i < dim; i++)
-                    {
-                        dot += q[(i * dim) + row] * v[i];
-                    }
-
-                    dot *= beta;
-                    for (int i = k; i < dim; i++)
-                    {
-                        q[(i * dim) + row] -= dot * v[i];
-                    }
-                }
-            }
-
-            for (int k = 0; k < dim; k++)
-            {
-                if (a[(k * dim) + k] < 0.0)
-                {
-                    for (int row = 0; row < dim; row++)
-                    {
-                        q[(k * dim) + row] = -q[(k * dim) + row];
-                    }
-                }
-            }
-
-            success = true;
-            double[] result = q;
-            q = null;
-            return result;
         }
-        finally
+
+        return matrix;
+    }
+
+    private void ValidateBuffers(Span<float> row, Span<float> scratch)
+    {
+        if (row.Length != _dim || scratch.Length != _dim)
         {
-            if (v != null) ArrayPool<double>.Shared.Return(v);
-            if (!success && q != null) ArrayPool<double>.Shared.Return(q);
+            throw new ArgumentException("Row and scratch lengths must equal the rotation dimension.");
+        }
+    }
+
+    private void ApplyRound(
+        ReadOnlySpan<float> source,
+        Span<float> destination,
+        int round,
+        float inverseNorm,
+        bool scaled)
+    {
+        int[] permutation = _permutations[round];
+        float[] signs = _signs[round];
+        for (int i = 0; i < _dim; i++)
+        {
+            float value = source[permutation[i]];
+            if (scaled)
+            {
+                value *= inverseNorm;
+            }
+
+            destination[i] = value * signs[i];
+        }
+
+        for (int offset = 0; offset < _dim; offset += _blockSize)
+        {
+            ApplyHadamard(destination.Slice(offset, _blockSize));
+        }
+    }
+
+    private void ApplyHadamard(Span<float> block)
+    {
+        int length = 1;
+        bool useAvx2 = Avx.IsSupported && block.Length >= 16;
+        while (length < block.Length)
+        {
+            int groupSize = length << 1;
+            for (int group = 0; group < block.Length; group += groupSize)
+            {
+                int j = 0;
+                if (useAvx2 && length >= Vector256<float>.Count)
+                {
+                    unsafe
+                    {
+                        fixed (float* p = block)
+                        {
+                            for (; j <= length - Vector256<float>.Count; j += Vector256<float>.Count)
+                            {
+                                Vector256<float> a = Avx.LoadVector256(p + group + j);
+                                Vector256<float> b = Avx.LoadVector256(p + group + length + j);
+                                Avx.Store(p + group + j, Avx.Add(a, b));
+                                Avx.Store(p + group + length + j, Avx.Subtract(a, b));
+                            }
+                        }
+                    }
+                }
+
+                for (; j < length; j++)
+                {
+                    float a = block[group + j];
+                    float b = block[group + length + j];
+                    block[group + j] = a + b;
+                    block[group + length + j] = a - b;
+                }
+            }
+
+            length = groupSize;
+        }
+
+        int i = 0;
+        if (useAvx2)
+        {
+            unsafe
+            {
+                fixed (float* p = block)
+                {
+                    Vector256<float> scale = Vector256.Create(_inverseSqrtBlock);
+                    for (; i <= block.Length - Vector256<float>.Count; i += Vector256<float>.Count)
+                    {
+                        Avx.Store(p + i, Avx.Multiply(Avx.LoadVector256(p + i), scale));
+                    }
+                }
+            }
+        }
+
+        for (; i < block.Length; i++)
+        {
+            block[i] *= _inverseSqrtBlock;
         }
     }
 }
 
 internal sealed class ChaCha8Rng
 {
-    private static readonly uint[] Constants =
+    private static ReadOnlySpan<uint> Constants =>
     [
-        0x61707865,
-        0x3320646e,
-        0x79622d32,
-        0x6b206574,
+        0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
     ];
 
     private readonly uint[] _state = new uint[16];
     private readonly uint[] _block = new uint[16];
     private int _index = 16;
-    private bool _hasSpare;
-    private double _spare;
 
-    public ChaCha8Rng(ulong seed)
+    public ChaCha8Rng(ReadOnlySpan<byte> seed)
     {
-        _state[0] = Constants[0];
-        _state[1] = Constants[1];
-        _state[2] = Constants[2];
-        _state[3] = Constants[3];
-        _state[4] = (uint)(seed & 0xffff_ffffUL);
-        _state[5] = (uint)(seed >> 32);
-        _state[6] = 0;
-        _state[7] = 0;
-        _state[8] = 0;
-        _state[9] = 0;
-        _state[10] = 0;
-        _state[11] = 0;
-        _state[12] = 0;
-        _state[13] = 0;
-        _state[14] = 0;
-        _state[15] = 0;
-    }
-
-    public double NextStandardNormal()
-    {
-        if (_hasSpare)
+        if (seed.Length != 32)
         {
-            _hasSpare = false;
-            return _spare;
+            throw new ArgumentException("ChaCha8 seed must be exactly 32 bytes.", nameof(seed));
         }
 
-        double u;
-        double v;
-        double s;
-        do
+        Constants.CopyTo(_state);
+        for (int i = 0; i < 8; i++)
         {
-            u = (2.0 * NextDouble()) - 1.0;
-            v = (2.0 * NextDouble()) - 1.0;
-            s = (u * u) + (v * v);
+            _state[4 + i] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(seed.Slice(i * 4, 4));
         }
-        while (s >= 1.0 || s == 0.0);
-
-        double mul = Math.Sqrt((-2.0 * Math.Log(s)) / s);
-        _spare = v * mul;
-        _hasSpare = true;
-        return u * mul;
     }
 
-    private double NextDouble()
+    public uint NextUInt32()
     {
-        ulong bits = ((ulong)NextUInt32() << 21) | ((ulong)NextUInt32() >> 11);
-        return bits * (1.0 / (1UL << 53));
-    }
-
-    private uint NextUInt32()
-    {
-        if (_index >= _block.Length)
+        if (_index == _block.Length)
         {
             GenerateBlock();
         }
@@ -231,10 +251,16 @@ internal sealed class ChaCha8Rng
         return _block[_index++];
     }
 
+    public ulong NextUInt64()
+    {
+        uint low = NextUInt32();
+        uint high = NextUInt32();
+        return low | ((ulong)high << 32);
+    }
+
     private void GenerateBlock()
     {
-        Array.Copy(_state, _block, _state.Length);
-
+        _state.CopyTo(_block, 0);
         for (int i = 0; i < 4; i++)
         {
             QuarterRound(_block, 0, 4, 8, 12);
@@ -252,8 +278,7 @@ internal sealed class ChaCha8Rng
             _block[i] += _state[i];
         }
 
-        _state[12]++;
-        if (_state[12] == 0)
+        if (++_state[12] == 0)
         {
             _state[13]++;
         }
@@ -264,15 +289,12 @@ internal sealed class ChaCha8Rng
     private static void QuarterRound(uint[] state, int a, int b, int c, int d)
     {
         state[a] += state[b];
-        state[d] = RotateLeft(state[d] ^ state[a], 16);
+        state[d] = BitOperations.RotateLeft(state[d] ^ state[a], 16);
         state[c] += state[d];
-        state[b] = RotateLeft(state[b] ^ state[c], 12);
+        state[b] = BitOperations.RotateLeft(state[b] ^ state[c], 12);
         state[a] += state[b];
-        state[d] = RotateLeft(state[d] ^ state[a], 8);
+        state[d] = BitOperations.RotateLeft(state[d] ^ state[a], 8);
         state[c] += state[d];
-        state[b] = RotateLeft(state[b] ^ state[c], 7);
+        state[b] = BitOperations.RotateLeft(state[b] ^ state[c], 7);
     }
-
-    private static uint RotateLeft(uint value, int amount)
-        => (value << amount) | (value >> (32 - amount));
 }

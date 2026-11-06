@@ -44,6 +44,8 @@ dotnet run --project benchmarks/TurboVector.Benchmarks -c Release -- --filter "*
 
 ## Usage at a Glance
 
+Dimensions must be positive multiples of 8 up to 16,384, and `bitWidth` must be 2, 3, or 4. Vector and query coordinates must be finite and have magnitude below `1e16`. `.tv` and `.tvim` snapshots use the Rust-compatible v8 container, with v7/v8 loading, TQ+ calibration persistence, stream APIs, and atomic replacement. `Sync(path)` durably appends complete units where possible, uses atomic replacement when changes require compaction, and detects a stale sync cursor. The older C# v2 format is intentionally not loaded.
+
 ```csharp
 using TurboVector;
 
@@ -60,7 +62,7 @@ SearchResults results = index.Search(query, k: 10);
 
 Console.WriteLine($"Best match: slot {results.Indices[0]}, score {results.Scores[0]:F4}");
 
-// Persist to disk (.tv binary format)
+// Persist to disk (Rust-compatible v8 snapshot)
 index.Write("my_index.tv");
 
 // Reload
@@ -84,9 +86,9 @@ idMap.Write("my_index.tvim");
 
 | Step | What happens |
 |------|--------------|
-| **Rotation** | A deterministic orthogonal matrix is computed from a ChaCha8 RNG seed + native Householder QR. Applied once per dimension at index-build time. |
-| **Codebook** | Lloyd-Max boundaries and centroids for a Beta((d−1)/2,(d−1)/2) distribution, computed via native Lanczos LogGamma + Lentz continued-fraction Beta CDF. Depends only on `bitWidth` and `dim` — reusable across indexes. |
-| **Encode** | Each vector is L2-normalised → rotated → thermometer-coded against the boundaries → bit-packed. A correction scale `s = ‖v‖ / ⟨u_rot, x̂⟩` is stored per vector. |
+| **Rotation** | A deterministic two-round, globally permuted block-Hadamard transform driven by the pinned ChaCha8 stream. Applied once per dimension at index-build time. |
+| **Codebook** | Lloyd-Max boundaries and centroids for a Beta((d−1)/2,(d−1)/2) distribution, matching the pinned Rust numerical procedure. Depends only on `bitWidth` and `dim` — reusable across indexes. |
+| **Encode** | Each vector is L2-normalised → rotated → optionally TQ+ calibrated → thermometer-coded against the boundaries → bit-packed. A correction scale is stored per vector. |
 | **Pack** | Codes are transposed into a blocked layout (32-vector blocks × byte-groups) for cache-friendly SIMD scoring. |
 | **Search** | A uint8 look-up table maps quantized query×centroid products. The score accumulator is `scale × acc + bias`, multiplied by the per-vector correction scale. |
 
@@ -102,8 +104,8 @@ idMap.Write("my_index.tvim");
 
 | Extension | Description |
 |-----------|-------------|
-| `.tv` | `TurboQuantIndex` — magic `TVPI` v2, packed codes + scales |
-| `.tvim` | `IdMapIndex` — magic `TVIM` v2, packed codes + scales + slot→id mapping |
+| `.tv` | `TurboQuantIndex` — Rust-compatible `TV8\0` v8 snapshot with calibration |
+| `.tvim` | `IdMapIndex` — same v8 container with external IDs stored in each row |
 
 ## Performance Notes
 

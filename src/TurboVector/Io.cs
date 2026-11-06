@@ -1,217 +1,186 @@
-using System.Buffers.Binary;
-
 namespace TurboVector;
 
+/// <summary>Controls whether a completed snapshot is flushed to stable storage.</summary>
+public enum Durability
+{
+    /// <summary>Flush file contents before atomically replacing the destination.</summary>
+    Durable,
+    /// <summary>Atomically replace the destination without forcing a disk flush.</summary>
+    Fast,
+}
+
+/// <summary>Data stored in a Rust-compatible TurboVector v7/v8 index image.</summary>
+public sealed record IndexFileData(
+    int BitWidth,
+    int Dim,
+    int VectorCount,
+    byte[] PackedCodes,
+    float[] Scales,
+    ulong[] Ids,
+    float[] TqPlusShift,
+    float[] TqPlusScale);
+
+/// <summary>Low-level Rust-compatible index snapshot serialization.</summary>
 public static class Io
 {
-    private static ReadOnlySpan<byte> TvMagic   => "TVPI"u8;
-    private static ReadOnlySpan<byte> TvimMagic => "TVIM"u8;
-    private const byte TvVersion = 2;
-    private const byte TvimVersion = 2;
+    public static void Write(
+        string path,
+        int bitWidth,
+        int dim,
+        int nVectors,
+        ReadOnlySpan<byte> packedCodes,
+        ReadOnlySpan<float> scales,
+        Durability durability = Durability.Durable)
+        => PersistenceV8.WriteFile(path, 0, bitWidth, dim, nVectors, packedCodes, scales, default, default, default, durability);
 
-    public static void Write(string path, int bitWidth, int dim, int nVectors, ReadOnlySpan<byte> packedCodes, ReadOnlySpan<float> scales)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(path);
-
-        using var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 1 << 16);
-        using var writer = new BinaryWriter(stream);
-        writer.Write(TvMagic);
-        writer.Write(TvVersion);
-        WriteCore(writer, bitWidth, dim, nVectors, packedCodes, scales);
-    }
+    public static void Write(
+        string path,
+        int bitWidth,
+        int dim,
+        int nVectors,
+        ReadOnlySpan<byte> packedCodes,
+        ReadOnlySpan<float> scales,
+        ReadOnlySpan<float> tqPlusShift,
+        ReadOnlySpan<float> tqPlusScale,
+        Durability durability = Durability.Durable)
+        => PersistenceV8.WriteFile(path, 0, bitWidth, dim, nVectors, packedCodes, scales, default,
+            tqPlusShift, tqPlusScale, durability);
 
     public static (int BitWidth, int Dim, int VectorCount, byte[] PackedCodes, float[] Scales) Load(string path)
     {
-        ArgumentException.ThrowIfNullOrEmpty(path);
-
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 1 << 16);
-        using var reader = new BinaryReader(stream);
-        var magic = ReadExactly(reader, 4);
-        // Old format (turbovec ≤ 0.4.3) had no magic bytes; the first byte was the
-        // bit-width stored as a raw integer (2, 3, or 4). Detect and reject it early.
-        if (magic[0] is >= 2 and <= 4)
+        LoadedIndex data = PersistenceV8.LoadFile(path, 0);
+        if (data.TqPlusShift.Length != 0)
         {
-            throw new InvalidDataException(
-                "File format from turbovec ≤ 0.4.3 detected. Rebuild the index with a current version of turbovec to continue.");
+            throw new InvalidDataException("This low-level tuple omits TQ+ calibration; use Io.LoadData to preserve it.");
         }
 
-        if (!magic.AsSpan().SequenceEqual(TvMagic))
-        {
-            throw new InvalidDataException($"wrong magic: expected TVPI, got {System.Text.Encoding.ASCII.GetString(magic)}.");
-        }
-
-        var version = reader.ReadByte();
-        if (version != TvVersion)
-        {
-            throw new InvalidDataException($"unsupported .tv version {version}; expected {TvVersion}.");
-        }
-
-        return ReadCore(reader);
+        return (data.BitWidth, data.Dim, data.VectorCount, data.PackedCodes, data.Scales);
     }
 
-    public static void WriteIdMap(string path, int bitWidth, int dim, int nVectors, ReadOnlySpan<byte> packedCodes, ReadOnlySpan<float> scales, ReadOnlySpan<ulong> slotToId)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(path);
+    public static IndexFileData LoadData(string path)
+        => ToPublicData(PersistenceV8.LoadFile(path, 0));
 
-        if (slotToId.Length != nVectors)
-        {
-            throw new ArgumentException($"Expected slotToId length {nVectors}, got {slotToId.Length}.", nameof(slotToId));
-        }
+    public static void WriteIdMap(
+        string path,
+        int bitWidth,
+        int dim,
+        int nVectors,
+        ReadOnlySpan<byte> packedCodes,
+        ReadOnlySpan<float> scales,
+        ReadOnlySpan<ulong> slotToId,
+        Durability durability = Durability.Durable)
+        => PersistenceV8.WriteFile(path, 1, bitWidth, dim, nVectors, packedCodes, scales, slotToId,
+            default, default, durability);
 
-        using var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 1 << 16);
-        using var writer = new BinaryWriter(stream);
-        writer.Write(TvimMagic);
-        writer.Write(TvimVersion);
-        WriteCore(writer, bitWidth, dim, nVectors, packedCodes, scales);
-
-        foreach (var id in slotToId)
-        {
-            WriteUInt64LittleEndian(writer, id);
-        }
-    }
+    public static void WriteIdMap(
+        string path,
+        int bitWidth,
+        int dim,
+        int nVectors,
+        ReadOnlySpan<byte> packedCodes,
+        ReadOnlySpan<float> scales,
+        ReadOnlySpan<ulong> slotToId,
+        ReadOnlySpan<float> tqPlusShift,
+        ReadOnlySpan<float> tqPlusScale,
+        Durability durability = Durability.Durable)
+        => PersistenceV8.WriteFile(path, 1, bitWidth, dim, nVectors, packedCodes, scales, slotToId,
+            tqPlusShift, tqPlusScale, durability);
 
     public static (int BitWidth, int Dim, int VectorCount, byte[] PackedCodes, float[] Scales, ulong[] SlotToId) LoadIdMap(string path)
     {
-        ArgumentException.ThrowIfNullOrEmpty(path);
-
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 1 << 16);
-        using var reader = new BinaryReader(stream);
-        var magic = ReadExactly(reader, 4);
-        if (!magic.AsSpan().SequenceEqual(TvimMagic))
+        LoadedIndex data = PersistenceV8.LoadFile(path, 1);
+        if (data.TqPlusShift.Length != 0)
         {
-            throw new InvalidDataException("invalid .tvim magic; expected TVIM.");
+            throw new InvalidDataException("This low-level tuple omits TQ+ calibration; use Io.LoadIdMapData to preserve it.");
         }
 
-        var version = reader.ReadByte();
-        if (version == 1)
-        {
-            throw new InvalidDataException(
-                "File format from turbovec ≤ 0.4.3 detected. Rebuild the index with a current version of turbovec to continue.");
-        }
-
-        if (version != TvimVersion)
-        {
-            throw new InvalidDataException($"unsupported .tvim version {version}; expected {TvimVersion}.");
-        }
-
-        var (bitWidth, dim, vectorCount, packedCodes, scales) = ReadCore(reader);
-        var slotToId = new ulong[vectorCount];
-        for (var i = 0; i < vectorCount; i++)
-        {
-            slotToId[i] = ReadUInt64LittleEndian(reader);
-        }
-
-        return (bitWidth, dim, vectorCount, packedCodes, scales, slotToId);
+        return (data.BitWidth, data.Dim, data.VectorCount, data.PackedCodes, data.Scales, data.Ids);
     }
 
-    private static void WriteCore(BinaryWriter writer, int bitWidth, int dim, int nVectors, ReadOnlySpan<byte> packedCodes, ReadOnlySpan<float> scales)
-    {
-        ValidateCore(bitWidth, dim, nVectors, packedCodes, scales);
+    public static IndexFileData LoadIdMapData(string path)
+        => ToPublicData(PersistenceV8.LoadFile(path, 1));
 
-        writer.Write((byte)bitWidth);
-        WriteUInt32LittleEndian(writer, checked((uint)dim));
-        WriteUInt32LittleEndian(writer, checked((uint)nVectors));
-        writer.Write(packedCodes);
-        foreach (var scale in scales)
-        {
-            WriteSingleLittleEndian(writer, scale);
-        }
-    }
+    public static byte[] ToBytes(
+        int bitWidth,
+        int dim,
+        int nVectors,
+        ReadOnlySpan<byte> packedCodes,
+        ReadOnlySpan<float> scales,
+        ReadOnlySpan<float> tqPlusShift = default,
+        ReadOnlySpan<float> tqPlusScale = default)
+        => PersistenceV8.ToBytes(0, bitWidth, dim, nVectors, packedCodes, scales, default, tqPlusShift, tqPlusScale);
 
-    private static (int BitWidth, int Dim, int VectorCount, byte[] PackedCodes, float[] Scales) ReadCore(BinaryReader reader)
-    {
-        var bitWidth = reader.ReadByte();
-        var dim = checked((int)ReadUInt32LittleEndian(reader));
-        var vectorCount = checked((int)ReadUInt32LittleEndian(reader));
+    public static byte[] ToIdMapBytes(
+        int bitWidth,
+        int dim,
+        int nVectors,
+        ReadOnlySpan<byte> packedCodes,
+        ReadOnlySpan<float> scales,
+        ReadOnlySpan<ulong> slotToId,
+        ReadOnlySpan<float> tqPlusShift = default,
+        ReadOnlySpan<float> tqPlusScale = default)
+        => PersistenceV8.ToBytes(1, bitWidth, dim, nVectors, packedCodes, scales, slotToId, tqPlusShift, tqPlusScale);
 
-        if (dim < 0 || dim % 8 != 0)
-        {
-            throw new InvalidDataException("dim must be divisible by 8.");
-        }
+    public static void WriteTo(
+        Stream output,
+        int bitWidth,
+        int dim,
+        int nVectors,
+        ReadOnlySpan<byte> packedCodes,
+        ReadOnlySpan<float> scales,
+        ReadOnlySpan<float> tqPlusShift = default,
+        ReadOnlySpan<float> tqPlusScale = default)
+        => PersistenceV8.WriteTo(output, 0, bitWidth, dim, nVectors, packedCodes, scales, default, tqPlusShift, tqPlusScale);
 
-        var packedCodeBytes = checked(dim / 8 * bitWidth * vectorCount);
-        var packedCodes = ReadExactly(reader, packedCodeBytes);
-        var scales = new float[vectorCount];
-        for (var i = 0; i < vectorCount; i++)
-        {
-            scales[i] = ReadSingleLittleEndian(reader);
-        }
+    public static void WriteIdMapTo(
+        Stream output,
+        int bitWidth,
+        int dim,
+        int nVectors,
+        ReadOnlySpan<byte> packedCodes,
+        ReadOnlySpan<float> scales,
+        ReadOnlySpan<ulong> slotToId,
+        ReadOnlySpan<float> tqPlusShift = default,
+        ReadOnlySpan<float> tqPlusScale = default)
+        => PersistenceV8.WriteTo(output, 1, bitWidth, dim, nVectors, packedCodes, scales, slotToId, tqPlusShift, tqPlusScale);
 
-        return (bitWidth, dim, vectorCount, packedCodes, scales);
-    }
+    public static IndexFileData LoadData(Stream input)
+        => ToPublicData(PersistenceV8.Load(input, 0));
 
-    private static void ValidateCore(int bitWidth, int dim, int nVectors, ReadOnlySpan<byte> packedCodes, ReadOnlySpan<float> scales)
-    {
-        if (bitWidth <= 0 || bitWidth > byte.MaxValue)
-        {
-            throw new ArgumentOutOfRangeException(nameof(bitWidth));
-        }
+    public static IndexFileData LoadIdMapData(Stream input)
+        => ToPublicData(PersistenceV8.Load(input, 1));
 
-        if (dim < 0 || dim % 8 != 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(dim), "dim must be non-negative and divisible by 8.");
-        }
+    public static IndexFileData LoadData(ReadOnlySpan<byte> bytes)
+        => ToPublicData(PersistenceV8.Load(bytes, 0));
 
-        ArgumentOutOfRangeException.ThrowIfNegative(nVectors);
+    public static IndexFileData LoadIdMapData(ReadOnlySpan<byte> bytes)
+        => ToPublicData(PersistenceV8.Load(bytes, 1));
 
-        var expectedPackedLength = checked(dim / 8 * bitWidth * nVectors);
-        if (packedCodes.Length != expectedPackedLength)
-        {
-            throw new ArgumentException($"Expected packedCodes length {expectedPackedLength}, got {packedCodes.Length}.", nameof(packedCodes));
-        }
+    internal static LoadedIndex LoadTurboQuantIndex(string path) => PersistenceV8.LoadFile(path, 0);
 
-        if (scales.Length != nVectors)
-        {
-            throw new ArgumentException($"Expected scales length {nVectors}, got {scales.Length}.", nameof(scales));
-        }
-    }
+    internal static LoadedIndex LoadIdMapIndex(string path) => PersistenceV8.LoadFile(path, 1);
 
-    private static byte[] ReadExactly(BinaryReader reader, int byteCount)
-    {
-        var bytes = reader.ReadBytes(byteCount);
-        if (bytes.Length != byteCount)
-        {
-            throw new EndOfStreamException($"Expected to read {byteCount} bytes, got {bytes.Length}.");
-        }
+    internal static LoadedIndex LoadTurboQuantIndex(Stream stream) => PersistenceV8.Load(stream, 0);
 
-        return bytes;
-    }
+    internal static LoadedIndex LoadTurboQuantIndex(ReadOnlySpan<byte> bytes) => PersistenceV8.Load(bytes, 0);
 
-    private static void WriteUInt32LittleEndian(BinaryWriter writer, uint value)
-    {
-        Span<byte> buffer = stackalloc byte[sizeof(uint)];
-        BinaryPrimitives.WriteUInt32LittleEndian(buffer, value);
-        writer.Write(buffer);
-    }
+    internal static LoadedIndex LoadIdMapIndex(Stream stream) => PersistenceV8.Load(stream, 1);
 
-    private static uint ReadUInt32LittleEndian(BinaryReader reader)
-    {
-        Span<byte> buffer = stackalloc byte[sizeof(uint)];
-        reader.BaseStream.ReadExactly(buffer);
-        return BinaryPrimitives.ReadUInt32LittleEndian(buffer);
-    }
+    internal static LoadedIndex LoadIdMapIndex(ReadOnlySpan<byte> bytes) => PersistenceV8.Load(bytes, 1);
 
-    private static void WriteUInt64LittleEndian(BinaryWriter writer, ulong value)
-    {
-        Span<byte> buffer = stackalloc byte[sizeof(ulong)];
-        BinaryPrimitives.WriteUInt64LittleEndian(buffer, value);
-        writer.Write(buffer);
-    }
+    internal static void WriteTurboQuantIndex(
+        string path, int bitWidth, int dim, int nVectors,
+        ReadOnlySpan<byte> packedCodes, ReadOnlySpan<float> scales,
+        ReadOnlySpan<float> shift, ReadOnlySpan<float> tqScale, Durability durability)
+        => PersistenceV8.WriteFile(path, 0, bitWidth, dim, nVectors, packedCodes, scales, default, shift, tqScale, durability);
 
-    private static ulong ReadUInt64LittleEndian(BinaryReader reader)
-    {
-        Span<byte> buffer = stackalloc byte[sizeof(ulong)];
-        reader.BaseStream.ReadExactly(buffer);
-        return BinaryPrimitives.ReadUInt64LittleEndian(buffer);
-    }
+    internal static void WriteIdMapIndex(
+        string path, int bitWidth, int dim, int nVectors,
+        ReadOnlySpan<byte> packedCodes, ReadOnlySpan<float> scales, ReadOnlySpan<ulong> ids,
+        ReadOnlySpan<float> shift, ReadOnlySpan<float> tqScale, Durability durability)
+        => PersistenceV8.WriteFile(path, 1, bitWidth, dim, nVectors, packedCodes, scales, ids, shift, tqScale, durability);
 
-    private static void WriteSingleLittleEndian(BinaryWriter writer, float value)
-    {
-        WriteUInt32LittleEndian(writer, unchecked((uint)BitConverter.SingleToInt32Bits(value)));
-    }
-
-    private static float ReadSingleLittleEndian(BinaryReader reader)
-    {
-        return BitConverter.Int32BitsToSingle(unchecked((int)ReadUInt32LittleEndian(reader)));
-    }
+    private static IndexFileData ToPublicData(LoadedIndex data)
+        => new(data.BitWidth, data.Dim, data.VectorCount, data.PackedCodes, data.Scales,
+            data.Ids, data.TqPlusShift, data.TqPlusScale);
 }

@@ -65,7 +65,9 @@ public sealed class TurboQuantIndex
     private byte[] _packedCodes;
     private int _packedLength;   // actual bytes used in _packedCodes (capacity may be larger)
     private float[] _scales;
-    private Lazy<float[]>? _rotation;
+    private float[] _tqplusShift = [];
+    private float[] _tqplusScale = [];
+    private Lazy<Rotation>? _rotation;
     private Lazy<(float[] Boundaries, float[] Centroids)>? _codebook;
     // volatile: reassigned (or nulled) on every Add/SwapRemove; volatile ensures
     // any concurrent reader sees the updated reference after a write.
@@ -73,6 +75,11 @@ public sealed class TurboQuantIndex
     // to prevent inconsistencies between _nVectors, _packedCodes, _scales, and _cachedBlocked.
     private volatile BlockedCache? _cachedBlocked;
     private readonly Lock _blockCacheLock = new();
+    private readonly Lock _syncLock = new();
+    private string? _syncPath;
+    private SyncCursor? _syncCursor;
+    private bool _syncAppendOnly;
+    private bool _syncAppendCompatible;
 
     public TurboQuantIndex(int dim, int bitWidth)
     {
@@ -87,7 +94,14 @@ public sealed class TurboQuantIndex
         InitializeLazies(dim);
     }
 
-    private TurboQuantIndex(int? dim, int bitWidth, int nVectors, byte[] packedCodes, float[] scales)
+    private TurboQuantIndex(
+        int? dim,
+        int bitWidth,
+        int nVectors,
+        byte[] packedCodes,
+        float[] scales,
+        float[]? tqPlusShift = null,
+        float[]? tqPlusScale = null)
     {
         ValidateBitWidth(bitWidth);
 
@@ -106,6 +120,8 @@ public sealed class TurboQuantIndex
         _packedCodes = packedCodes;
         _packedLength = packedCodes.Length;
         _scales = scales;
+        _tqplusShift = tqPlusShift ?? [];
+        _tqplusScale = tqPlusScale ?? [];
 
         if (dim is not null)
         {
@@ -127,6 +143,12 @@ public sealed class TurboQuantIndex
         if (scales.Length != nVectors)
         {
             throw new ArgumentException($"Expected scales length {nVectors}, got {scales.Length}.", nameof(scales));
+        }
+
+        if (_tqplusShift.Length != _tqplusScale.Length
+            || (_tqplusShift.Length != 0 && _tqplusShift.Length != dim))
+        {
+            throw new ArgumentException("TQ+ calibration arrays must both be empty or have one value per dimension.");
         }
 
         if (dim is not null)
@@ -174,8 +196,8 @@ public sealed class TurboQuantIndex
             _scales = newScales;
         }
 
-        Encoder.EncodeInto(
-            vectors, n, dim, rotation, boundaries, centroids, _bitWidth,
+        Encoder.EncodeIntoCalibrated(
+            vectors, n, dim, rotation, boundaries, centroids, _tqplusShift, _tqplusScale, _bitWidth,
             _packedCodes.AsSpan(_packedLength, batchPackedLen),
             _scales.AsSpan(_nVectors, n));
 
@@ -198,6 +220,108 @@ public sealed class TurboQuantIndex
         }
 
         Add(vectors);
+    }
+
+    public void Calibrate(ReadOnlySpan<float> sample)
+    {
+        int dim = _dim ?? throw new InvalidOperationException(
+            "Dimension is not set. Use Calibrate2D on a lazy index.");
+        Calibrate2D(sample, dim);
+    }
+
+    public void Calibrate2D(ReadOnlySpan<float> sample, int dim)
+    {
+        ValidateDim(dim);
+        if (_dim is int existingDim && existingDim != dim)
+        {
+            throw new ArgumentException($"Index dimension {existingDim} does not match provided dim {dim}.", nameof(dim));
+        }
+
+        if (sample.Length % dim != 0)
+        {
+            throw new ArgumentException("sample length must be divisible by dim.", nameof(sample));
+        }
+
+        int rows = sample.Length / dim;
+        if (rows < 2)
+        {
+            throw new ArgumentException("Calibration sample must contain at least two vectors.", nameof(sample));
+        }
+
+        InputValidation.ValidateValues(sample, dim, nameof(sample));
+        Rotation rotation = _rotation?.Value ?? Rotation.Create(dim);
+        var (boundaries, centroids) = _codebook?.Value ?? Codebook.Compute(_bitWidth, dim);
+        var (shift, scale) = TqPlusCalibration.Fit(sample, rows, dim, rotation, centroids);
+        if (shift.All(static value => value == 0.0f) && scale.All(static value => value == 1.0f))
+        {
+            throw new ArgumentException("Calibration sample is degenerate; no per-coordinate calibration could be fitted.", nameof(sample));
+        }
+
+        byte[]? reencoded = null;
+        float[]? reencodedScales = null;
+        if (_nVectors > 0)
+        {
+            reencoded = new byte[_packedLength];
+            reencodedScales = new float[_nVectors];
+            byte[] codes = Pack.ExtractCodes(
+                new ReadOnlySpan<byte>(_packedCodes, 0, _packedLength), _nVectors, _bitWidth, dim);
+            float[] reconstructed = new float[checked(_nVectors * dim)];
+            float[] norms = new float[_nVectors];
+            float[] inverseOldScale = new float[dim];
+            for (int d = 0; d < dim; d++)
+            {
+                inverseOldScale[d] = _tqplusScale.Length == 0 ? 1.0f : 1.0f / _tqplusScale[d];
+            }
+
+            for (int row = 0; row < _nVectors; row++)
+            {
+                double sumSquares = 0.0;
+                int rowStart = row * dim;
+                for (int d = 0; d < dim; d++)
+                {
+                    float oldShift = _tqplusShift.Length == 0 ? 0.0f : _tqplusShift[d];
+                    float value = centroids[codes[rowStart + d]] * inverseOldScale[d] - oldShift;
+                    reconstructed[rowStart + d] = value;
+                    sumSquares += (double)value * value;
+                }
+
+                norms[row] = (float)((double)_scales[row] * sumSquares);
+            }
+
+            Encoder.EncodePrerotatedInto(
+                reconstructed,
+                norms,
+                _nVectors,
+                dim,
+                boundaries,
+                centroids,
+                shift,
+                scale,
+                _bitWidth,
+                reencoded,
+                reencodedScales);
+        }
+
+        if (_dim is null)
+        {
+            _dim = dim;
+            _rotation = new Lazy<Rotation>(() => rotation, LazyThreadSafetyMode.ExecutionAndPublication);
+            _codebook = new Lazy<(float[] Boundaries, float[] Centroids)>(
+                () => (boundaries, centroids),
+                LazyThreadSafetyMode.ExecutionAndPublication);
+        }
+
+        if (reencoded is not null)
+        {
+            _packedCodes = reencoded;
+            _packedLength = reencoded.Length;
+            _scales = reencodedScales!;
+            _cachedBlocked = null;
+        }
+
+        _tqplusShift = shift;
+        _tqplusScale = scale;
+        _syncAppendOnly = false;
     }
 
     public SearchResults Search(ReadOnlySpan<float> queries, int k)
@@ -269,7 +393,9 @@ public sealed class TurboQuantIndex
                     blocked.NBlocks,
                     effectiveK,
                     rentedMask,
-                    wordCount);
+                    wordCount,
+                    _tqplusShift,
+                    _tqplusScale);
                 result = new SearchResults(scores, indices, nq, effectiveK);
             }
             else
@@ -287,7 +413,9 @@ public sealed class TurboQuantIndex
                     blocked.NBlocks,
                     effectiveK,
                     rentedMask,
-                    wordCount);
+                    wordCount,
+                    _tqplusShift,
+                    _tqplusScale);
                 result = new SearchResults(Scores, Indices, nq, effectiveK);
             }
         }
@@ -311,20 +439,165 @@ public sealed class TurboQuantIndex
         _ = EnsureBlocked();
     }
 
-    public void Write(string path)
-        => Io.Write(path, _bitWidth, _dim ?? 0, _nVectors,
+    public void Write(string path, Durability durability = Durability.Durable)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        lock (_syncLock)
+        {
+            Io.WriteTurboQuantIndex(path, _bitWidth, _dim ?? 0, _nVectors,
+                new ReadOnlySpan<byte>(_packedCodes, 0, _packedLength),
+                new ReadOnlySpan<float>(_scales, 0, _nVectors), _tqplusShift, _tqplusScale, durability);
+            ForgetSyncBindingIfPathMatches(path);
+        }
+    }
+
+    public byte[] ToBytes()
+        => Io.ToBytes(_bitWidth, _dim ?? 0, _nVectors,
             new ReadOnlySpan<byte>(_packedCodes, 0, _packedLength),
-            new ReadOnlySpan<float>(_scales, 0, _nVectors));
+            new ReadOnlySpan<float>(_scales, 0, _nVectors), _tqplusShift, _tqplusScale);
+
+    public void WriteTo(Stream output)
+        => Io.WriteTo(output, _bitWidth, _dim ?? 0, _nVectors,
+            new ReadOnlySpan<byte>(_packedCodes, 0, _packedLength),
+            new ReadOnlySpan<float>(_scales, 0, _nVectors), _tqplusShift, _tqplusScale);
+
+    /// <summary>
+    /// Durably commits this index to a v8 file. New complete 32-row units are
+    /// appended when the existing sync cursor is current; other changes use
+    /// an atomic full rewrite. A path already bound by a prior Sync or Load
+    /// is protected against replacement or advancement by another writer.
+    /// </summary>
+    public void Sync(string path)
+    {
+        SyncCore(path, 0, default);
+    }
 
     public static TurboQuantIndex Load(string path)
     {
-        var (bitWidth, dim, nVectors, packedCodes, scales) = Io.Load(path);
-        int? dimOpt = dim == 0 ? null : dim;
-        return FromParts(dimOpt, bitWidth, nVectors, packedCodes, scales);
+        LoadedIndex data = Io.LoadTurboQuantIndex(path);
+        var index = FromParts(data.Dim == 0 ? null : data.Dim, data.BitWidth, data.VectorCount,
+            data.PackedCodes, data.Scales, data.TqPlusShift, data.TqPlusScale);
+        index.BindSyncState(data, path);
+        return index;
     }
 
-    internal static TurboQuantIndex FromParts(int? dim, int bitWidth, int nVectors, byte[] packedCodes, float[] scales)
-        => new(dim, bitWidth, nVectors, packedCodes, scales);
+    public static TurboQuantIndex Load(Stream input)
+    {
+        LoadedIndex data = Io.LoadTurboQuantIndex(input);
+        return FromParts(data.Dim == 0 ? null : data.Dim, data.BitWidth, data.VectorCount,
+            data.PackedCodes, data.Scales, data.TqPlusShift, data.TqPlusScale);
+    }
+
+    public static TurboQuantIndex Load(ReadOnlySpan<byte> bytes)
+    {
+        LoadedIndex data = Io.LoadTurboQuantIndex(bytes);
+        return FromParts(data.Dim == 0 ? null : data.Dim, data.BitWidth, data.VectorCount,
+            data.PackedCodes, data.Scales, data.TqPlusShift, data.TqPlusScale);
+    }
+
+    internal void WriteIdMapSnapshot(string path, ReadOnlySpan<ulong> ids, Durability durability)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        if (ids.Length != _nVectors)
+        {
+            throw new ArgumentException("ID count does not match the index length.", nameof(ids));
+        }
+
+        lock (_syncLock)
+        {
+            Io.WriteIdMapIndex(path, _bitWidth, _dim ?? 0, _nVectors,
+                new ReadOnlySpan<byte>(_packedCodes, 0, _packedLength),
+                new ReadOnlySpan<float>(_scales, 0, _nVectors), ids,
+                _tqplusShift, _tqplusScale, durability);
+            ForgetSyncBindingIfPathMatches(path);
+        }
+    }
+
+    internal static TurboQuantIndex FromParts(
+        int? dim, int bitWidth, int nVectors, byte[] packedCodes, float[] scales,
+        float[]? tqPlusShift = null, float[]? tqPlusScale = null)
+        => new(dim, bitWidth, nVectors, packedCodes, scales, tqPlusShift, tqPlusScale);
+
+    internal void SyncWithIds(string path, ReadOnlySpan<ulong> ids)
+    {
+        if (ids.Length != _nVectors)
+        {
+            throw new ArgumentException("ID count does not match the index length.", nameof(ids));
+        }
+
+        SyncCore(path, 1, ids);
+    }
+
+    private void SyncCore(string path, int kind, ReadOnlySpan<ulong> ids)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        int dim = _dim ?? throw new InvalidOperationException(
+            "Cannot sync a lazy index that has never seen an add or calibrate.");
+        string fullPath = Path.GetFullPath(path);
+        lock (_syncLock)
+        {
+            bool sameTarget = _syncCursor is not null && PathsEqual(_syncPath, fullPath);
+            if (sameTarget)
+            {
+                SyncCursor cursor = _syncCursor!.Value;
+                if (_syncAppendOnly && _syncAppendCompatible
+                    && _nVectors >= cursor.VectorCount
+                    && (_nVectors / Constants.Block - cursor.VectorCount / Constants.Block) <= 1024)
+                {
+                    _syncCursor = PersistenceV8.AppendSync(
+                        fullPath, kind, _bitWidth, dim, cursor.VectorCount, _nVectors,
+                        new ReadOnlySpan<byte>(_packedCodes, 0, _packedLength),
+                        new ReadOnlySpan<float>(_scales, 0, _nVectors), ids,
+                        _tqplusShift, _tqplusScale, cursor);
+                    _syncAppendOnly = true;
+                    _syncAppendCompatible = true;
+                    return;
+                }
+
+                PersistenceV8.VerifySyncCursor(fullPath, kind, _bitWidth, dim, cursor);
+            }
+
+            SyncCursor written = PersistenceV8.WriteSyncFile(
+                fullPath, kind, _bitWidth, dim, _nVectors,
+                new ReadOnlySpan<byte>(_packedCodes, 0, _packedLength),
+                new ReadOnlySpan<float>(_scales, 0, _nVectors), ids,
+                _tqplusShift, _tqplusScale);
+            _syncPath = fullPath;
+            _syncCursor = written;
+            _syncAppendOnly = true;
+            _syncAppendCompatible = true;
+        }
+    }
+
+    internal void BindSyncState(LoadedIndex data, string path)
+    {
+        if (!data.IsV8 || data.Nonce == 0)
+        {
+            return;
+        }
+
+        _syncPath = Path.GetFullPath(path);
+        _syncCursor = new SyncCursor(data.Nonce, data.Generation, data.VectorCount);
+        _syncAppendOnly = data.AppendCompatible;
+        _syncAppendCompatible = data.AppendCompatible;
+    }
+
+    private void ForgetSyncBindingIfPathMatches(string path)
+    {
+        if (_syncCursor is not null && PathsEqual(_syncPath, Path.GetFullPath(path)))
+        {
+            _syncPath = null;
+            _syncCursor = null;
+            _syncAppendOnly = false;
+            _syncAppendCompatible = false;
+        }
+    }
+
+    private static bool PathsEqual(string? left, string right)
+        => string.Equals(
+            left,
+            right,
+            OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
 
     public int SwapRemove(int idx)
     {
@@ -352,6 +625,7 @@ public sealed class TurboQuantIndex
         _packedLength -= bytesPerVec;
         _nVectors--;
         _cachedBlocked = null;
+        _syncAppendOnly = false;
         return last;
     }
 
@@ -365,9 +639,16 @@ public sealed class TurboQuantIndex
 
     public int BitWidth => _bitWidth;
 
-    internal ReadOnlySpan<byte> PackedCodes => new(_packedCodes, 0, _packedLength);
+    public CalibrationState CalibrationState
+        => _tqplusShift.Length == 0 ? CalibrationState.Uncalibrated : CalibrationState.Calibrated;
 
-    internal ReadOnlySpan<float> Scales => new(_scales, 0, _nVectors);
+    public ReadOnlySpan<byte> PackedCodes => new(_packedCodes, 0, _packedLength);
+
+    public ReadOnlySpan<float> Scales => new(_scales, 0, _nVectors);
+
+    public ReadOnlySpan<float> TqPlusShift => _tqplusShift;
+
+    public ReadOnlySpan<float> TqPlusScale => _tqplusScale;
 
     private void InitializeLazies(int dim)
     {
@@ -384,8 +665,8 @@ public sealed class TurboQuantIndex
         }
     }
 
-    private static Lazy<float[]> MakeRotationLazy(int dim) =>
-        new(() => Rotation.MakeRotationMatrix(dim), LazyThreadSafetyMode.ExecutionAndPublication);
+    private static Lazy<Rotation> MakeRotationLazy(int dim) =>
+        new(() => Rotation.Create(dim), LazyThreadSafetyMode.ExecutionAndPublication);
 
     private static Lazy<(float[] Boundaries, float[] Centroids)> MakeCodebookLazy(int bitWidth, int dim) =>
         new(() => Codebook.Compute(bitWidth, dim), LazyThreadSafetyMode.ExecutionAndPublication);
@@ -422,18 +703,8 @@ public sealed class TurboQuantIndex
     }
 
     private static void ValidateBitWidth(int bitWidth)
-    {
-        if (bitWidth < 2 || bitWidth > 4)
-        {
-            throw new ArgumentOutOfRangeException(nameof(bitWidth), "bitWidth must be between 2 and 4.");
-        }
-    }
+        => InputValidation.ValidateBitWidth(bitWidth, nameof(bitWidth));
 
     private static void ValidateDim(int dim)
-    {
-        if (dim <= 0 || dim % 8 != 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(dim), "dim must be positive and divisible by 8.");
-        }
-    }
+        => InputValidation.ValidateDimension(dim, nameof(dim));
 }

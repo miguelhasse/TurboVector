@@ -29,10 +29,7 @@ public sealed class IdMapIndex
 
     public void AddWithIds2D(ReadOnlySpan<float> vectors, int dim, ReadOnlySpan<ulong> ids)
     {
-        if (dim <= 0 || (dim % 8) != 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(dim), "dim must be positive and divisible by 8.");
-        }
+        InputValidation.ValidateDimension(dim, nameof(dim));
 
         if (_inner.DimOpt is int existingDim && existingDim != dim)
         {
@@ -181,6 +178,10 @@ public sealed class IdMapIndex
 
     public bool Contains(ulong id) => _idToSlot.ContainsKey(id);
 
+    public void Calibrate(ReadOnlySpan<float> sample) => _inner.Calibrate(sample);
+
+    public void Calibrate2D(ReadOnlySpan<float> sample, int dim) => _inner.Calibrate2D(sample, dim);
+
     public int Len => _slotToId.Count;
 
     public bool IsEmpty => _slotToId.Count == 0;
@@ -191,27 +192,86 @@ public sealed class IdMapIndex
 
     public int BitWidth => _inner.BitWidth;
 
+    public CalibrationState CalibrationState => _inner.CalibrationState;
+
+    public ReadOnlySpan<float> TqPlusShift => _inner.TqPlusShift;
+
+    public ReadOnlySpan<float> TqPlusScale => _inner.TqPlusScale;
+
     public void Prepare() => _inner.Prepare();
 
-    public void Write(string path)
-        => Io.WriteIdMap(path, _inner.BitWidth, _inner.DimOpt ?? 0, _inner.Len, _inner.PackedCodes, _inner.Scales, CollectionsMarshal.AsSpan(_slotToId));
+    public void Write(string path, Durability durability = Durability.Durable)
+        => _inner.WriteIdMapSnapshot(path, CollectionsMarshal.AsSpan(_slotToId), durability);
+
+    /// <summary>Durably commits this index, appending complete units when possible.</summary>
+    public void Sync(string path) => _inner.SyncWithIds(path, CollectionsMarshal.AsSpan(_slotToId));
+
+    public byte[] ToBytes()
+        => Io.ToIdMapBytes(_inner.BitWidth, _inner.DimOpt ?? 0, _inner.Len,
+            _inner.PackedCodes, _inner.Scales, CollectionsMarshal.AsSpan(_slotToId),
+            _inner.TqPlusShift, _inner.TqPlusScale);
+
+    public void WriteTo(Stream output)
+        => Io.WriteIdMapTo(output, _inner.BitWidth, _inner.DimOpt ?? 0, _inner.Len,
+            _inner.PackedCodes, _inner.Scales, CollectionsMarshal.AsSpan(_slotToId),
+            _inner.TqPlusShift, _inner.TqPlusScale);
 
     public static IdMapIndex Load(string path)
     {
-        var (bitWidth, dim, nVectors, packedCodes, scales, slotToId) = Io.LoadIdMap(path);
-        int? dimOpt = dim == 0 ? null : dim;
-        var inner = TurboQuantIndex.FromParts(dimOpt, bitWidth, nVectors, packedCodes, scales);
+        LoadedIndex data = Io.LoadIdMapIndex(path);
+        int? dimOpt = data.Dim == 0 ? null : data.Dim;
+        var inner = TurboQuantIndex.FromParts(dimOpt, data.BitWidth, data.VectorCount,
+            data.PackedCodes, data.Scales, data.TqPlusShift, data.TqPlusScale);
+        inner.BindSyncState(data, path);
 
-        var idToSlot = new Dictionary<ulong, int>(nVectors);
-        for (int i = 0; i < slotToId.Length; i++)
+        var idToSlot = new Dictionary<ulong, int>(data.VectorCount);
+        for (int i = 0; i < data.Ids.Length; i++)
         {
-            if (!idToSlot.TryAdd(slotToId[i], i))
+            if (!idToSlot.TryAdd(data.Ids[i], i))
             {
-                throw new InvalidDataException($"duplicate id {slotToId[i]} at slot {i} in .tvim file");
+                throw new InvalidDataException($"duplicate id {data.Ids[i]} at slot {i} in index file");
             }
         }
 
-        return new IdMapIndex(inner, [.. slotToId], idToSlot);
+        return new IdMapIndex(inner, [.. data.Ids], idToSlot);
+    }
+
+    public static IdMapIndex Load(Stream input)
+    {
+        LoadedIndex data = Io.LoadIdMapIndex(input);
+        int? dimOpt = data.Dim == 0 ? null : data.Dim;
+        var inner = TurboQuantIndex.FromParts(dimOpt, data.BitWidth, data.VectorCount,
+            data.PackedCodes, data.Scales, data.TqPlusShift, data.TqPlusScale);
+
+        var idToSlot = new Dictionary<ulong, int>(data.VectorCount);
+        for (int i = 0; i < data.Ids.Length; i++)
+        {
+            if (!idToSlot.TryAdd(data.Ids[i], i))
+            {
+                throw new InvalidDataException($"duplicate id {data.Ids[i]} at slot {i} in index image");
+            }
+        }
+
+        return new IdMapIndex(inner, [.. data.Ids], idToSlot);
+    }
+
+    public static IdMapIndex Load(ReadOnlySpan<byte> bytes)
+    {
+        LoadedIndex data = Io.LoadIdMapIndex(bytes);
+        int? dimOpt = data.Dim == 0 ? null : data.Dim;
+        var inner = TurboQuantIndex.FromParts(dimOpt, data.BitWidth, data.VectorCount,
+            data.PackedCodes, data.Scales, data.TqPlusShift, data.TqPlusScale);
+
+        var idToSlot = new Dictionary<ulong, int>(data.VectorCount);
+        for (int i = 0; i < data.Ids.Length; i++)
+        {
+            if (!idToSlot.TryAdd(data.Ids[i], i))
+            {
+                throw new InvalidDataException($"duplicate id {data.Ids[i]} at slot {i} in index image");
+            }
+        }
+
+        return new IdMapIndex(inner, [.. data.Ids], idToSlot);
     }
 
     private IdMapIndex(TurboQuantIndex inner, List<ulong> slotToId, Dictionary<ulong, int> idToSlot)

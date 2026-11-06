@@ -93,6 +93,58 @@ public static class Search
             mask.Length);
     }
 
+    internal static (float[] Scores, long[] Indices) Search_(
+        ReadOnlySpan<float> queries,
+        int nq,
+        Rotation rotation,
+        byte[] blockedCodes,
+        float[] centroids,
+        float[] vecScales,
+        int bitWidth,
+        int dim,
+        int nVectors,
+        int nBlocks,
+        int k,
+        ulong[]? mask,
+        int maskLength,
+        float[] tqplusShift,
+        float[] tqplusScale)
+    {
+        ArgumentNullException.ThrowIfNull(rotation);
+        ArgumentNullException.ThrowIfNull(blockedCodes);
+        ArgumentNullException.ThrowIfNull(centroids);
+        ArgumentNullException.ThrowIfNull(vecScales);
+        if (maskLength < 0 || (mask is null ? maskLength != 0 : maskLength > mask.Length))
+        {
+            throw new ArgumentOutOfRangeException(nameof(maskLength));
+        }
+
+        ReadOnlySpan<float> scales = vecScales.AsSpan(0, nVectors);
+        ReadOnlySpan<ulong> maskSpan = mask is null ? ReadOnlySpan<ulong>.Empty : mask.AsSpan(0, maskLength);
+        ValidateInputs(queries, nq, centroids, scales, bitWidth, dim, nVectors, k, maskSpan);
+        if (rotation.Dim != dim)
+        {
+            throw new ArgumentException("rotation dimension must equal dim.", nameof(rotation));
+        }
+        ValidateCalibration(dim, tqplusShift, tqplusScale);
+
+        if (bitWidth == 3)
+        {
+            throw new NotSupportedException("Use Search3Bit_ for blocked 3-bit codes.");
+        }
+
+        int nByteGroups = GetNByteGroups(bitWidth, dim);
+        int expectedLength = checked(nBlocks * nByteGroups * Constants.Block);
+        if (blockedCodes.Length != expectedLength)
+        {
+            throw new ArgumentException($"Expected blockedCodes length {expectedLength}, got {blockedCodes.Length}.", nameof(blockedCodes));
+        }
+
+        return RunBlockedNibbleSearch(
+            queries, nq, default, blockedCodes, centroids, vecScales, bitWidth,
+            dim, nVectors, nBlocks, k, mask, maskLength, rotation, tqplusShift, tqplusScale);
+    }
+
     public static (float[] Scores, long[] Indices) Search_(
         ReadOnlySpan<float> queries,
         int nq,
@@ -106,7 +158,9 @@ public static class Search
         int nBlocks,
         int k,
         ulong[]? mask,
-        int maskLength)
+        int maskLength,
+        float[] tqplusShift,
+        float[] tqplusScale)
     {
         ArgumentNullException.ThrowIfNull(blockedCodes);
         ArgumentNullException.ThrowIfNull(centroids);
@@ -252,6 +306,59 @@ public static class Search
             maskLength);
     }
 
+    internal static (float[] Scores, long[] Indices) Search3Bit_(
+        ReadOnlySpan<float> queries,
+        int nq,
+        Rotation rotation,
+        byte[] subCodes,
+        byte[] plane2Blocked,
+        float[] centroids,
+        float[] vecScales,
+        int dim,
+        int nVectors,
+        int nBlocks,
+        int k,
+        ulong[]? mask,
+        int maskLength,
+        float[] tqplusShift,
+        float[] tqplusScale)
+    {
+        ArgumentNullException.ThrowIfNull(rotation);
+        ArgumentNullException.ThrowIfNull(subCodes);
+        ArgumentNullException.ThrowIfNull(plane2Blocked);
+        ArgumentNullException.ThrowIfNull(centroids);
+        ArgumentNullException.ThrowIfNull(vecScales);
+        if (maskLength < 0 || (mask is null ? maskLength != 0 : maskLength > mask.Length))
+        {
+            throw new ArgumentOutOfRangeException(nameof(maskLength));
+        }
+
+        ReadOnlySpan<float> scales = vecScales.AsSpan(0, nVectors);
+        ReadOnlySpan<ulong> maskSpan = mask is null ? ReadOnlySpan<ulong>.Empty : mask.AsSpan(0, maskLength);
+        ValidateInputs(queries, nq, centroids, scales, 3, dim, nVectors, k, maskSpan);
+        if (rotation.Dim != dim)
+        {
+            throw new ArgumentException("rotation dimension must equal dim.", nameof(rotation));
+        }
+        ValidateCalibration(dim, tqplusShift, tqplusScale);
+
+        int subLength = checked(nBlocks * (dim / 4) * Constants.Block);
+        int planeLength = checked(nBlocks * (dim / 8) * Constants.Block);
+        if (subCodes.Length != subLength)
+        {
+            throw new ArgumentException($"Expected subCodes length {subLength}, got {subCodes.Length}.", nameof(subCodes));
+        }
+
+        if (plane2Blocked.Length != planeLength)
+        {
+            throw new ArgumentException($"Expected plane2Blocked length {planeLength}, got {plane2Blocked.Length}.", nameof(plane2Blocked));
+        }
+
+        return RunBlocked3BitSearch(
+            queries, nq, default, subCodes, plane2Blocked, centroids, vecScales,
+            dim, nVectors, nBlocks, k, mask, maskLength, rotation, tqplusShift, tqplusScale);
+    }
+
     private static (float[] Scores, long[] Indices) RunPackedNibbleSearch(
         ReadOnlySpan<float> queries,
         int nq,
@@ -338,7 +445,10 @@ public static class Search
         int nBlocks,
         int k,
         ulong[]? mask,
-        int maskLength)
+        int maskLength,
+        Rotation? rotationPlan = null,
+        float[]? tqplusShift = null,
+        float[]? tqplusScale = null)
     {
         ReadOnlySpan<ulong> maskSpan = mask is null ? ReadOnlySpan<ulong>.Empty : mask.AsSpan(0, maskLength);
 
@@ -362,7 +472,16 @@ public static class Search
         float[]? rotBuf = ArrayPool<float>.Shared.Rent(rotSize);
         try
         {
-            FillRotatedQueries(queries, nq, dim, rotation, rotBuf.AsSpan(0, rotSize));
+            if (rotationPlan is null)
+            {
+                FillRotatedQueries(queries, nq, dim, rotation, rotBuf.AsSpan(0, rotSize));
+            }
+            else
+            {
+                FillRotatedQueries(queries, nq, dim, rotationPlan, rotBuf.AsSpan(0, rotSize));
+            }
+            float[]? biasCorrections = ApplyQueryCalibration(
+                rotBuf, nq, dim, tqplusShift, tqplusScale);
             float[] rotatedQueries = rotBuf; // alias for clarity; safe as Parallel.For is synchronous
 
             // Collect results into per-query local arrays inside the parallel loop to avoid
@@ -391,6 +510,11 @@ public static class Search
                         4 => BuildLut4BitInto(qRot, centroidsSpan, lutSpan),
                         _ => throw new NotSupportedException("Nibble search only supports 2-bit or 4-bit codes."),
                     };
+                    if (biasCorrections is not null)
+                    {
+                        bias += biasCorrections[0];
+                    }
+
                     var (scores, indices) = bitWidth switch
                     {
                         2 => Score2Bit(blockedSpan, lut, scale, bias, vecScalesSpan, dim, nVectors, nBlocks, effectiveK, maskSpan),
@@ -421,6 +545,10 @@ public static class Search
                             4 => BuildLut4BitInto(qRot, centroids, lutSpan),
                             _ => throw new NotSupportedException("Nibble search only supports 2-bit or 4-bit codes."),
                         };
+                        if (biasCorrections is not null)
+                        {
+                            bias += biasCorrections[qi];
+                        }
 
                         var (scores, indices) = bitWidth switch
                         {
@@ -470,7 +598,10 @@ public static class Search
         int nBlocks,
         int k,
         ulong[]? mask,
-        int maskLength)
+        int maskLength,
+        Rotation? rotationPlan = null,
+        float[]? tqplusShift = null,
+        float[]? tqplusScale = null)
     {
         ReadOnlySpan<ulong> maskSpan = mask is null ? ReadOnlySpan<ulong>.Empty : mask.AsSpan(0, maskLength);
 
@@ -494,7 +625,16 @@ public static class Search
         float[]? rotBuf = ArrayPool<float>.Shared.Rent(rotSize);
         try
         {
-            FillRotatedQueries(queries, nq, dim, rotation, rotBuf.AsSpan(0, rotSize));
+            if (rotationPlan is null)
+            {
+                FillRotatedQueries(queries, nq, dim, rotation, rotBuf.AsSpan(0, rotSize));
+            }
+            else
+            {
+                FillRotatedQueries(queries, nq, dim, rotationPlan, rotBuf.AsSpan(0, rotSize));
+            }
+            float[]? biasCorrections = ApplyQueryCalibration(
+                rotBuf, nq, dim, tqplusShift, tqplusScale);
             float[] rotatedQueries = rotBuf; // alias; Parallel.For is synchronous so safe to return after
 
             // Collect results into per-query local arrays inside the parallel loop to avoid
@@ -512,6 +652,11 @@ public static class Search
                     var qRot = new ReadOnlySpan<float>(rotatedQueries, 0, dim);
                     var lutSpan = lut.AsSpan(0, lutSize);
                     var (scale, bias) = BuildLut3BitInto(qRot, centroidsSpan, lutSpan);
+                    if (biasCorrections is not null)
+                    {
+                        bias += biasCorrections[0];
+                    }
+
                     var (scores, indices) = Score3Bit(subCodesSpan, plane2BlockedSpan, lut, scale, bias, vecScalesSpan, dim, nVectors, nBlocks, effectiveK, maskSpan);
                     perQueryScores[0] = scores;
                     perQueryIndices[0] = indices;
@@ -532,6 +677,11 @@ public static class Search
                         var lutSpan = lut.AsSpan(0, lutSize);
                         var qMask = mask is null ? ReadOnlySpan<ulong>.Empty : mask.AsSpan(0, maskLength);
                         var (scale, bias) = BuildLut3BitInto(qRot, centroids, lutSpan);
+                        if (biasCorrections is not null)
+                        {
+                            bias += biasCorrections[qi];
+                        }
+
                         var (scores, indices) = Score3Bit(subCodes, plane2Blocked, lut, scale, bias, vecScales, dim, nVectors, nBlocks, effectiveK, qMask);
                         perQueryScores[qi] = scores;
                         perQueryIndices[qi] = indices;
@@ -572,6 +722,83 @@ public static class Search
             {
                 dest[i * dim + row] = TensorPrimitives.Dot(queries.Slice(i * dim, dim), rotRow);
             }
+        }
+    }
+
+    private static void FillRotatedQueries(ReadOnlySpan<float> queries, int nq, int dim, Rotation rotation, Span<float> dest)
+    {
+        if (queries.Length != checked(nq * dim) || dest.Length < checked(nq * dim))
+        {
+            throw new ArgumentException("queries and destination lengths must match nq * dim.");
+        }
+
+        float[] scratch = ArrayPool<float>.Shared.Rent(dim);
+        try
+        {
+            for (int i = 0; i < nq; i++)
+            {
+                Span<float> rotated = dest.Slice(i * dim, dim);
+                queries.Slice(i * dim, dim).CopyTo(rotated);
+                rotation.Apply(rotated, scratch.AsSpan(0, dim));
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(scratch);
+        }
+    }
+
+    private static float[]? ApplyQueryCalibration(
+        float[] rotatedQueries,
+        int nq,
+        int dim,
+        float[]? shift,
+        float[]? scale)
+    {
+        if (shift is null && scale is null)
+        {
+            return null;
+        }
+
+        if (shift is null || scale is null)
+        {
+            throw new ArgumentException("Calibration shift and scale must both be provided.");
+        }
+
+        ValidateCalibration(dim, shift, scale);
+        if (shift.Length == 0)
+        {
+            return null;
+        }
+
+        float[] biasCorrections = new float[nq];
+        for (int qi = 0; qi < nq; qi++)
+        {
+            int rowStart = qi * dim;
+            double bias = 0.0;
+            for (int d = 0; d < dim; d++)
+            {
+                float original = rotatedQueries[rowStart + d];
+                rotatedQueries[rowStart + d] = original / scale[d];
+                bias -= (double)original * shift[d];
+            }
+
+            biasCorrections[qi] = (float)bias;
+        }
+
+        return biasCorrections;
+    }
+
+    private static void ValidateCalibration(int dim, float[] shift, float[] scale)
+    {
+        if (shift.Length == 0 && scale.Length == 0)
+        {
+            return;
+        }
+
+        if (shift.Length != dim || scale.Length != dim)
+        {
+            throw new ArgumentException("Calibration shift and scale must both be empty or have length dim.");
         }
     }
 
@@ -941,7 +1168,7 @@ public static class Search
         while (index > 0)
         {
             int parent = (index - 1) >> 1;
-            if (heapScores[parent] <= heapScores[index])
+            if (!IsWorseCandidate(heapScores, heapIndices, index, parent))
             {
                 break;
             }
@@ -962,21 +1189,25 @@ public static class Search
             }
 
             int right = left + 1;
-            int smallest = left;
-            if (right < heapSize && heapScores[right] < heapScores[left])
+            int worst = left;
+            if (right < heapSize && IsWorseCandidate(heapScores, heapIndices, right, left))
             {
-                smallest = right;
+                worst = right;
             }
 
-            if (heapScores[index] <= heapScores[smallest])
+            if (IsWorseCandidate(heapScores, heapIndices, index, worst))
             {
                 return;
             }
 
-            Swap(heapScores, heapIndices, index, smallest);
-            index = smallest;
+            Swap(heapScores, heapIndices, index, worst);
+            index = worst;
         }
     }
+
+    private static bool IsWorseCandidate(float[] scores, int[] indices, int candidate, int other)
+        => scores[candidate] < scores[other]
+            || (scores[candidate] == scores[other] && indices[candidate] > indices[other]);
 
     private static void FinalizeTopK(float[] scores, int[] indices, int heapSize)
     {
@@ -985,9 +1216,52 @@ public static class Search
             return;
         }
 
-        Array.Sort(scores, indices, 0, heapSize);
+        for (int start = (heapSize >> 1) - 1; start >= 0; start--)
+        {
+            SiftDownForResultSort(scores, indices, start, heapSize);
+        }
+
+        for (int end = heapSize - 1; end > 0; end--)
+        {
+            Swap(scores, indices, 0, end);
+            SiftDownForResultSort(scores, indices, 0, end);
+        }
+
         scores.AsSpan(0, heapSize).Reverse();
         indices.AsSpan(0, heapSize).Reverse();
+    }
+
+    private static void SiftDownForResultSort(float[] scores, int[] indices, int index, int length)
+    {
+        while (true)
+        {
+            int left = (index * 2) + 1;
+            if (left >= length)
+            {
+                return;
+            }
+
+            int right = left + 1;
+            int greater = left;
+            if (right < length && CompareForAscendingResultOrder(scores, indices, right, left) > 0)
+            {
+                greater = right;
+            }
+
+            if (CompareForAscendingResultOrder(scores, indices, index, greater) >= 0)
+            {
+                return;
+            }
+
+            Swap(scores, indices, index, greater);
+            index = greater;
+        }
+    }
+
+    private static int CompareForAscendingResultOrder(float[] scores, int[] indices, int left, int right)
+    {
+        int scoreOrder = scores[left].CompareTo(scores[right]);
+        return scoreOrder != 0 ? scoreOrder : indices[right].CompareTo(indices[left]);
     }
 
     private static void Swap(float[] heapScores, int[] heapIndices, int a, int b)
@@ -1124,25 +1398,37 @@ public static class Search
         int k,
         ReadOnlySpan<ulong> mask)
     {
-        ArgumentOutOfRangeException.ThrowIfNegative(nq);
-
-        if (dim <= 0 || (dim % 8) != 0)
+        ValidateInputs(queries, nq, centroids, vecScales, bitWidth, dim, nVectors, k, mask);
+        if (rotation.Length != checked(dim * dim))
         {
-            throw new ArgumentOutOfRangeException(nameof(dim), "dim must be positive and divisible by 8.");
+            throw new ArgumentException("rotation length must equal dim * dim.", nameof(rotation));
         }
+    }
+
+    private static void ValidateInputs(
+        ReadOnlySpan<float> queries,
+        int nq,
+        ReadOnlySpan<float> centroids,
+        ReadOnlySpan<float> vecScales,
+        int bitWidth,
+        int dim,
+        int nVectors,
+        int k,
+        ReadOnlySpan<ulong> mask)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(nq);
+        InputValidation.ValidateDimension(dim, nameof(dim));
+        InputValidation.ValidateBitWidth(bitWidth, nameof(bitWidth));
 
         ArgumentOutOfRangeException.ThrowIfNegative(nVectors);
         ArgumentOutOfRangeException.ThrowIfNegative(k);
 
-        if (queries.Length != nq * dim)
+        if (queries.Length != checked(nq * dim))
         {
             throw new ArgumentException("queries length must equal nq * dim.", nameof(queries));
         }
 
-        if (rotation.Length != dim * dim)
-        {
-            throw new ArgumentException("rotation length must equal dim * dim.", nameof(rotation));
-        }
+        InputValidation.ValidateValues(queries, dim, nameof(queries));
 
         int expectedCentroids = 1 << bitWidth;
         if (centroids.Length != expectedCentroids)

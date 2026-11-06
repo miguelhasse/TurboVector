@@ -6,11 +6,13 @@ The core algorithm library. Targets **net10.0**, enables unsafe code (bit-packin
 |---------|-----|
 | `System.Numerics.Tensors` | SIMD-accelerated Norm, Multiply, Dot in hot paths |
 
-All mathematical routines (Householder QR, Lanczos LogGamma, Lentz continued-fraction Beta CDF, Gauss-Legendre quadrature) are implemented natively — no external math library is required.
+Rotation, codebook construction, calibration, encoding, packing, and search are implemented in the library without external math packages.
 
 ---
 
 ## Public API
+
+Dimensions must be positive multiples of 8 and no greater than 16,384; bit widths are 2, 3, or 4. Added vectors and search queries reject non-finite coordinates and coordinates whose magnitude is at least `1e16`. Zero vectors are accepted and receive a zero score. File writes use the Rust-compatible v8 snapshot format, a sibling temporary file, and atomic replacement. `Durability.Durable` flushes the file before replacement; `Durability.Fast` skips the forced flush. `Sync(path)` is the durable stateful API: it appends new complete 32-row units and commits an alternating v8 header when the existing cursor is current. Changes that cannot be represented as append-only data (such as swap-removal or recalibration) use an atomic full rewrite. A path bound by `Sync` or loaded from a claimed v8 file is protected against replacement or advancement by another writer. Both index types also support `ToBytes()` and `WriteTo(Stream)`; loading is available from a path, stream, or byte span. Rust v7 and v8 images are accepted; the former C# v2 format is intentionally not loaded.
 
 ### `TurboQuantIndex` — slot-based index
 
@@ -25,6 +27,10 @@ var index = TurboQuantIndex.NewLazy(int bitWidth);
 index.Add(ReadOnlySpan<float> vectors);
 index.Add2D(ReadOnlySpan<float> vectors, int dim); // also sets dim on lazy index
 
+// Optional TQ+ per-coordinate calibration from a representative sample
+index.Calibrate(ReadOnlySpan<float> sample);
+index.Calibrate2D(ReadOnlySpan<float> sample, int dim); // also sets dim on lazy index
+
 // Search — returns top-k results for every query row
 SearchResults results = index.Search(ReadOnlySpan<float> queries, int k);
 
@@ -38,8 +44,13 @@ int movedSlot = index.SwapRemove(int idx);
 index.Prepare();
 
 // Persist / reload
-index.Write(string path);                          // writes .tv file
+index.Write(string path);                          // durable v8 snapshot
+index.Write(string path, Durability.Fast);         // atomic, without forced disk flush
+index.Sync(string path);                           // durable append-oriented sync
+byte[] snapshot = index.ToBytes();
+index.WriteTo(Stream output);
 TurboQuantIndex loaded = TurboQuantIndex.Load(string path);
+TurboQuantIndex fromBytes = TurboQuantIndex.Load(snapshot);
 
 // Properties
 int  index.Len       // number of vectors currently stored
@@ -47,7 +58,10 @@ bool index.IsEmpty
 int  index.Dim       // 0 if lazy and no vectors added yet
 int? index.DimOpt    // null if lazy and no vectors added yet
 int  index.BitWidth
+CalibrationState index.CalibrationState
 ```
+
+Calibration adjusts quantization to a representative sample and applies the matching inverse transform and bias correction during search. Its shift and scale arrays are persisted in the v8 superblock and restored when loading.
 
 ### `SearchResults`
 
@@ -74,6 +88,10 @@ var idMap = IdMapIndex.NewLazy(int bitWidth);
 idMap.AddWithIds(ReadOnlySpan<float> vectors, ReadOnlySpan<ulong> ids);
 idMap.AddWithIds2D(ReadOnlySpan<float> vectors, int dim, ReadOnlySpan<ulong> ids);
 
+// Optional calibration is shared with the wrapped slot-based index
+idMap.Calibrate(ReadOnlySpan<float> sample);
+idMap.Calibrate2D(ReadOnlySpan<float> sample, int dim);
+
 // Remove by external ID (O(1)); returns false if not found
 bool removed = idMap.Remove(ulong id);
 
@@ -91,7 +109,10 @@ int   idMap.Dim
 int?  idMap.DimOpt
 int   idMap.BitWidth
 
-idMap.Write(string path);                    // writes .tvim file
+idMap.Write(string path);                    // durable v8 snapshot
+idMap.Sync(string path);                     // durable append-oriented sync
+byte[] snapshot = idMap.ToBytes();
+idMap.WriteTo(Stream output);
 IdMapIndex loaded = IdMapIndex.Load(string path);
 ```
 
@@ -102,12 +123,13 @@ IdMapIndex loaded = IdMapIndex.Load(string path);
 | File | Responsibility |
 |------|----------------|
 | `Constants.cs` | `Block=32`, `FlushEvery=256`, `RotationSeed=42UL` |
-| `Rotation.cs` | Deterministic orthogonal matrix via ChaCha8 RNG + native Householder QR; includes `ChaCha8Rng` (8-round) and Box-Muller Gaussian sampling |
-| `Codebook.cs` | Lloyd-Max quantizer — boundaries and centroids for Beta((d−1)/2,(d−1)/2); native Beta CDF via Lanczos LogGamma + Lentz continued-fraction; Gauss-Legendre quadrature fallback |
-| `Encode.cs` | Normalise → rotate → thermometer-code → pack → compute correction scales |
+| `Rotation.cs` | Deterministic two-round globally permuted block-Hadamard transform, with scalar and AVX2 kernels |
+| `Codebook.cs` | Lloyd-Max quantizer for Beta((d−1)/2,(d−1)/2), using the pinned upstream Beta and adaptive-Simpson algorithms |
+| `TqPlusCalibration.cs` | Fits deterministic per-coordinate shift/scale values from a representative sample |
+| `Encode.cs` | Normalize → rotate → calibrate → thermometer-code → pack → compute correction scales |
 | `Pack.cs` | Transpose packed codes into SIMD-friendly blocked layout (32-vector blocks) |
 | `Search.cs` | LUT-based scored search for 2-bit, 3-bit, and 4-bit codes; min-heap top-k |
-| `Io.cs` | Binary `.tv` (v2) and `.tvim` serialisation/deserialisation |
+| `Io.cs`, `PersistenceV8.cs` | Rust-compatible v8 snapshots, v7/v8 loading, calibration, stream and byte APIs |
 
 ### `Encoder.Encode` pipeline (hot path)
 
@@ -141,24 +163,17 @@ score *= vecScale[vecIdx]                      // per-vector correction
 
 ## File Format Details
 
-### `.tv` (TurboQuantIndex v2)
+### `.tv` and `.tvim` (Rust-compatible v8)
 
 ```
-Bytes   Field
-4       magic: ASCII "TVPI"
-1       version: 0x02
-1       bit_width (u8)
-4       dim (u32 LE)
-4       n_vectors (u32 LE)
-n_vectors × (dim/8 × bit_width)   packed_codes (byte[])
-n_vectors × 4                      scales (float32 LE[])
+superblock      TV8\0, revision, bit width, index kind, unit layout, dimension,
+                file nonce, redo-op capacity, canonical codebook, TQ+ calibration,
+                CRC-32C
+header slots    Two alternating generation/count/tail/redo-op/delta-digest headers
+block units     32 rows of sequential blocked codes, scales, and optional IDs
 ```
 
-v1 detection: first byte ∈ {2, 3, 4} with no `TVPI` magic → `InvalidDataException` with a rebuild hint.
-
-### `.tvim` (IdMapIndex v2)
-
-Same header as `.tv` but magic `TVIM`, followed by `n_vectors × 8` bytes of `slot_to_id` (ulong LE[]).
+`Write`, `ToBytes`, and `WriteTo` emit v8 sequential-layout snapshots with an unclaimed nonce; readers accept Rust v7 sequential files and v8 sequential or planes-layout files. `Sync` claims its path with a random nonce, flushes appended units before publishing the alternate commit header, and verifies the previous header's delta before advancing it. Incomplete appends are ignored by the last valid header and truncated before retry. The file kind distinguishes slot indexes from ID-mapped indexes. `Durability.Durable` flushes snapshot contents before atomic replacement; `Sync` is always durable.
 
 ---
 

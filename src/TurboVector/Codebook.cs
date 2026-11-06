@@ -8,34 +8,34 @@ namespace TurboVector;
 /// </summary>
 public static class Codebook
 {
-    private static readonly double[] LanczosCoefficients =
+    private const double GammaR = 10.900511;
+    private const double F64Precision = 2.22044604925031308085e-16;
+    private const double F64MinPositive = 2.2250738585072014e-308;
+    private const double LnTwoSqrtEOverPi = 0.6207822376352452223455184457816472;
+    private static readonly double[] GammaCoefficients =
     [
-        0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059,
-        12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7
-    ];
-
-    private static readonly double[] GlNodes =
-    [
-        -0.9739065285171717, -0.8650633666889845, -0.6794095682990244, -0.4333953941292472, -0.1488743389816312,
-         0.1488743389816312,  0.4333953941292472,  0.6794095682990244,  0.8650633666889845,  0.9739065285171717
-    ];
-
-    private static readonly double[] GlWeights =
-    [
-        0.0666713443086881, 0.1494513491505806, 0.2190863625159820, 0.2692667193099963, 0.2955242247147529,
-        0.2955242247147529, 0.2692667193099963, 0.2190863625159820, 0.1494513491505806, 0.0666713443086881
+        2.48574089138753565546e-5, 1.05142378581721974210, -3.45687097222016235469,
+        4.51227709466894823700, -2.98285225323576655721, 1.05639711577126713077,
+        -1.95428773191645869583e-1, 1.70970543404441224307e-2, -5.71926117404305781283e-4,
+        4.63399473359905636708e-6, -2.71994908488607703910e-9,
     ];
 
     /// <summary>Returns quantization boundaries and centroids for the given bit width and dimension.</summary>
     public static (float[] Boundaries, float[] Centroids) Compute(int bits, int dim)
-        => LloydMax(bits, dim, 200, 1e-12);
+    {
+        InputValidation.ValidateBitWidth(bits, nameof(bits));
+        InputValidation.ValidateDimension(dim, nameof(dim));
+        return LloydMax(bits, dim, 200, 1e-12);
+    }
+
+    internal static double BetaCdf(double x, double shape)
+        => RegularizedBetaIncomplete(x, shape, shape);
 
     private static (float[] Boundaries, float[] Centroids) LloydMax(int bits, int dim, int maxIter, double tol)
     {
         double a = (dim - 1.0) / 2.0;
-        double logBetaAA = LogBeta(a, a);
-
         int nLevels = 1 << bits;
+        double logBetaAA = LogGamma(a + a) - LogGamma(a) - LogGamma(a);
 
         double stdDev = Math.Sqrt(2.0 * a / ((2.0 * a + 1.0) * 4.0 * a));
         double spread = 3.0 * stdDev;
@@ -52,12 +52,6 @@ public static class Codebook
         double[] newCentroids = new double[nLevels];
         edges[0] = -1.0;
         edges[nLevels] = 1.0;
-
-        double DensityIntegrand(double x)
-        {
-            double t = (x + 1.0) / 2.0;
-            return x * BetaDensityHalf(t, a, logBetaAA) / 2.0;
-        }
 
         for (int iter = 0; iter < maxIter; iter++)
         {
@@ -85,7 +79,16 @@ public static class Codebook
                 }
                 else
                 {
-                    double mean = GaussLegendre10(DensityIntegrand, lo, hi);
+                    double mean = AdaptiveSimpson(
+                        x =>
+                        {
+                            double t = (x + 1.0) / 2.0;
+                            return x * BetaDensityHalf(t, a, logBetaAA) / 2.0;
+                        },
+                        lo,
+                        hi,
+                        1e-14,
+                        50);
                     newCentroids[i] = mean / prob;
                 }
             }
@@ -105,18 +108,16 @@ public static class Codebook
             }
         }
 
-        float[] resultBoundaries = new float[nLevels - 1];
-
-        for (int i = 0; i < nLevels - 1; i++)
-        {
-            resultBoundaries[i] = (float)((centroids[i] + centroids[i + 1]) / 2.0);
-        }
-
         float[] resultCentroids = new float[nLevels];
-
         for (int i = 0; i < nLevels; i++)
         {
             resultCentroids[i] = (float)centroids[i];
+        }
+
+        float[] resultBoundaries = new float[nLevels - 1];
+        for (int i = 0; i < nLevels - 1; i++)
+        {
+            resultBoundaries[i] = (resultCentroids[i] + resultCentroids[i + 1]) * 0.5f;
         }
 
         return (resultBoundaries, resultCentroids);
@@ -126,24 +127,25 @@ public static class Codebook
     {
         if (x < 0.5)
         {
-            return Math.Log(Math.PI / Math.Sin(Math.PI * x)) - LogGamma(1.0 - x);
+            double sum = GammaCoefficients[0];
+            for (int i = 1; i < GammaCoefficients.Length; i++)
+            {
+                sum += GammaCoefficients[i] / (i - x);
+            }
+
+            return Math.Log(Math.PI) - Math.Log(Math.Sin(Math.PI * x)) - Math.Log(sum)
+                - LnTwoSqrtEOverPi - (0.5 - x) * Math.Log((0.5 - x + GammaR) / Math.E);
         }
 
-        x -= 1.0;
-        const double g = 7.0;
-        double a = LanczosCoefficients[0];
-
-        for (int i = 1; i < LanczosCoefficients.Length; i++)
+        double s = GammaCoefficients[0];
+        for (int i = 1; i < GammaCoefficients.Length; i++)
         {
-            a += LanczosCoefficients[i] / (x + i);
+            s += GammaCoefficients[i] / (x + i - 1.0);
         }
 
-        double t = x + g + 0.5;
-        return 0.5 * Math.Log(2.0 * Math.PI) + (x + 0.5) * Math.Log(t) - t + Math.Log(a);
+        return Math.Log(s) + LnTwoSqrtEOverPi
+            + (x - 0.5) * Math.Log((x - 0.5 + GammaR) / Math.E);
     }
-
-    private static double LogBeta(double a, double b)
-        => LogGamma(a) + LogGamma(b) - LogGamma(a + b);
 
     private static double BetaDensityHalf(double x, double a, double logBetaAA)
     {
@@ -152,36 +154,33 @@ public static class Codebook
             return 0.0;
         }
 
-        return Math.Exp((a - 1.0) * Math.Log(x) + (a - 1.0) * Math.Log(1.0 - x) - logBetaAA);
+        double bb = (a - 1.0) * Math.Log(x);
+        double cc = (a - 1.0) * Math.Log(1.0 - x);
+        return Math.Exp(logBetaAA + bb + cc);
     }
 
     private static double RegularizedBetaIncomplete(double x, double a, double b)
     {
-        if (x <= 0.0)
+        if (x == 0.0)
         {
             return 0.0;
         }
 
-        if (x >= 1.0)
+        if (x == 1.0)
         {
             return 1.0;
         }
 
-        if (x > (a + 1.0) / (a + b + 2.0))
+        double bt = Math.Exp(
+            LogGamma(a + b) - LogGamma(a) - LogGamma(b)
+            + a * Math.Log(x) + b * Math.Log(1.0 - x));
+        bool symmetricTransform = x >= (a + 1.0) / (a + b + 2.0);
+        double fpMin = F64MinPositive / F64Precision;
+        if (symmetricTransform)
         {
-            return 1.0 - RegularizedBetaIncomplete(1.0 - x, b, a);
+            (a, b) = (b, a);
+            x = 1.0 - x;
         }
-
-        double lbetaAb = LogBeta(a, b);
-        double front = Math.Exp(Math.Log(x) * a + Math.Log(1.0 - x) * b - lbetaAb) / a;
-        return front * BetaContinuedFraction(x, a, b);
-    }
-
-    private static double BetaContinuedFraction(double x, double a, double b)
-    {
-        const int maxIter = 200;
-        const double eps = 3e-15;
-        const double fpMin = 1e-30;
 
         double qab = a + b;
         double qap = a + 1.0;
@@ -196,10 +195,11 @@ public static class Codebook
         d = 1.0 / d;
         double h = d;
 
-        for (int m = 1; m <= maxIter; m++)
+        for (int m = 1; m < 141; m++)
         {
-            int m2 = 2 * m;
-            double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+            double md = m;
+            double m2 = md * 2.0;
+            double aa = md * (b - md) * x / ((qam + m2) * (a + m2));
             d = 1.0 + aa * d;
 
             if (Math.Abs(d) < fpMin)
@@ -215,9 +215,9 @@ public static class Codebook
             }
 
             d = 1.0 / d;
-            h *= d * c;
+            h = h * d * c;
 
-            aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+            aa = -(a + md) * (qab + md) * x / ((a + m2) * (qap + m2));
             d = 1.0 + aa * d;
 
             if (Math.Abs(d) < fpMin)
@@ -235,36 +235,51 @@ public static class Codebook
             double del = d * c;
             h *= del;
 
-            if (Math.Abs(del - 1.0) < eps)
+            if (Math.Abs(del - 1.0) <= F64Precision)
             {
-                break;
+                return symmetricTransform ? 1.0 - bt * h / a : bt * h / a;
             }
         }
 
-        return h;
+        return symmetricTransform ? 1.0 - bt * h / a : bt * h / a;
     }
 
-    private static double GaussLegendre10(Func<double, double> f, double lo, double hi)
+    private static double AdaptiveSimpson(Func<double, double> f, double a, double b, double tolerance, int maxDepth)
     {
-        const int panels = 4;
-        double width = (hi - lo) / panels;
-        double total = 0.0;
+        double mid = (a + b) / 2.0;
+        double fa = f(a);
+        double fb = f(b);
+        double fm = f(mid);
+        double whole = (b - a) / 6.0 * (fa + 4.0 * fm + fb);
+        return AdaptiveSimpsonRecursive(f, a, b, fa, fb, fm, whole, tolerance, maxDepth);
+    }
 
-        for (int panel = 0; panel < panels; panel++)
+    private static double AdaptiveSimpsonRecursive(
+        Func<double, double> f,
+        double a,
+        double b,
+        double fa,
+        double fb,
+        double fm,
+        double whole,
+        double tolerance,
+        int depth)
+    {
+        double mid = (a + b) / 2.0;
+        double m1 = (a + mid) / 2.0;
+        double m2 = (mid + b) / 2.0;
+        double fm1 = f(m1);
+        double fm2 = f(m2);
+        double left = (mid - a) / 6.0 * (fa + 4.0 * fm1 + fm);
+        double right = (b - mid) / 6.0 * (fm + 4.0 * fm2 + fb);
+        double refined = left + right;
+
+        if (depth == 0 || Math.Abs(refined - whole) < 15.0 * tolerance)
         {
-            double panelLo = lo + (panel * width);
-            double panelHi = panelLo + width;
-            double mid = 0.5 * (panelLo + panelHi);
-            double half = 0.5 * (panelHi - panelLo);
-            double sum = 0.0;
-            for (int i = 0; i < 10; i++)
-            {
-                sum += GlWeights[i] * f(mid + half * GlNodes[i]);
-            }
-
-            total += half * sum;
+            return refined + (refined - whole) / 15.0;
         }
 
-        return total;
+        return AdaptiveSimpsonRecursive(f, a, mid, fa, fm, fm1, left, tolerance / 2.0, depth - 1)
+            + AdaptiveSimpsonRecursive(f, mid, b, fm, fb, fm2, right, tolerance / 2.0, depth - 1);
     }
 }
