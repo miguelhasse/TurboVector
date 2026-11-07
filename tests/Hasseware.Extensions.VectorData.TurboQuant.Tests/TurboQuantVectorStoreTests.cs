@@ -89,6 +89,100 @@ public sealed class TurboQuantVectorStoreTests : IDisposable
     }
 
     [Theory]
+    [InlineData(2, false)]
+    [InlineData(2, true)]
+    [InlineData(3, false)]
+    [InlineData(3, true)]
+    [InlineData(4, false)]
+    [InlineData(4, true)]
+    public async Task ProviderSearchPreservesCoreScoresAndOrdering(int bits, bool filtered)
+    {
+        const int dim = 8;
+        const int count = 129;
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var vectors = new float[count * dim];
+        var state = 0xc0ffeeUL;
+        for (var i = 0; i < vectors.Length; i++)
+        {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            vectors[i] = ((int)((state >> 32) & 0xffff) - 32768) / 32768f;
+        }
+
+        var records = new Document[count];
+        for (var i = 0; i < count; i++)
+        {
+            records[i] = new Document(i.ToString(), "parity", i, vectors.AsMemory(i * dim, dim));
+        }
+        var collection = new InMemoryVectorStore(bits).GetCollection("parity", TestMappings.Document);
+        await collection.UpsertAsync(records, cancellationToken);
+        var query = new float[] { 0.5f, -0.75f, 0.25f, 1f, -1f, 0.125f, -0.5f, 0.375f };
+        var options = new VectorSearchOptions<Document>
+        {
+            Filter = filtered ? document => document.Rank % 2 == 0 : null
+        };
+        var actual = await ToListAsync(collection.SearchAsync(query, 5, options, cancellationToken));
+
+        var index = new TurboQuantIndex(dim, bits);
+        index.Add(vectors);
+        var mask = filtered ? Enumerable.Range(0, count).Select(static i => i % 2 == 0).ToArray() : [];
+        var expected = index.SearchWithMask(query, 5, mask);
+        Assert.Equal(expected.Indices.Select(static id => id.ToString()), actual.Select(static result => result.Record.Id));
+        Assert.Equal(expected.Scores.Select(static score => (double)score),
+            actual.Select(static result => Assert.IsType<double>(result.Score)));
+    }
+
+    [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(false, false, true)]
+    [InlineData(false, true, false)]
+    [InlineData(false, true, true)]
+    [InlineData(true, false, false)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    [InlineData(true, true, true)]
+    public async Task FilteredOrderingUsesVectorsBeforeProjection(bool includeVectors, bool ascendingVector, bool descendingRank)
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var store = new InMemoryVectorStore();
+        var collection = store.GetCollection("documents", TestMappings.Document);
+        await collection.UpsertAsync(
+        [
+            new Document("first", "guide", 1, Axis0),
+            new Document("second", "guide", 3, Axis1),
+            new Document("third", "guide", 2, Axis2)
+        ], cancellationToken);
+
+        var result = await ToListAsync(collection.GetAsync(
+            document => document.Category == "guide", 2,
+            new FilteredRecordRetrievalOptions<Document>
+            {
+                IncludeVectors = includeVectors,
+                Skip = 1,
+                OrderBy = orderBy =>
+                {
+                    var primary = ascendingVector
+                        ? orderBy.Ascending(document => document.Embedding.ToArray()[0])
+                        : orderBy.Descending(document => document.Embedding.ToArray()[0]);
+                    return descendingRank
+                        ? primary.Descending(document => document.Rank)
+                        : primary.Ascending(document => document.Rank);
+                }
+            }, cancellationToken));
+
+        var expectedIds = (ascendingVector, descendingRank) switch
+        {
+            (false, false) => new[] { "third", "second" },
+            (false, true) => ["second", "third"],
+            (true, false) => ["second", "first"],
+            (true, true) => ["third", "first"]
+        };
+        Assert.Equal(expectedIds, result.Select(document => document.Id));
+        Assert.All(result, document => Assert.Equal(includeVectors ? 8 : 0, document.Embedding.Length));
+    }
+
+    [Theory]
     [InlineData(0)]
     [InlineData(1)]
     public async Task ScoreThresholdStillHonorsTopAndSkip(int skip)
@@ -152,6 +246,92 @@ public sealed class TurboQuantVectorStoreTests : IDisposable
 
         Assert.Equal("aligned", Assert.Single(results).Record.Id);
         Assert.Equal(100f, large[0]);
+    }
+
+    [Theory]
+    [InlineData(1e-11f, false)]
+    [InlineData(1e-20f, false)]
+    [InlineData(1e-30f, false)]
+    [InlineData(float.Epsilon, false)]
+    [InlineData(1e15f, false)]
+    [InlineData(9e15f, false)]
+    [InlineData(1e-11f, true)]
+    [InlineData(1e-20f, true)]
+    [InlineData(1e-30f, true)]
+    [InlineData(float.Epsilon, true)]
+    [InlineData(1e15f, true)]
+    [InlineData(9e15f, true)]
+    public async Task CosineSearchPreservesDirectionOfExtremeVectors(float magnitude, bool useDistance)
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var store = new InMemoryVectorStore();
+        var mapping = useDistance
+            ? new TurboQuantRecordMapping<string, CosineDocument>
+            {
+                Definition = new VectorStoreCollectionDefinition
+                {
+                    Properties =
+                    [
+                        new VectorStoreKeyProperty("Id", typeof(string)),
+                        new VectorStoreVectorProperty("Embedding", typeof(ReadOnlyMemory<float>), 8)
+                        {
+                            DistanceFunction = DistanceFunction.CosineDistance
+                        }
+                    ]
+                },
+                RecordTypeInfo = TestJsonContext.Default.CosineDocument,
+                KeyTypeInfo = TestJsonContext.Default.String,
+                GetKey = static document => document.Id,
+                GetVector = static document => document.Embedding
+            }
+            : TestMappings.CosineDocument;
+        var baseline = store.GetCollection("baseline", mapping);
+        var scaled = store.GetCollection("scaled", mapping);
+        var direction = new[] { 1f, 1f, 0f, 0f, 0f, 0f, 0f, 0f };
+        var orthogonal = new[] { -1f, 1f, 0f, 0f, 0f, 0f, 0f, 0f };
+        var tiny = new[] { magnitude, magnitude, 0f, 0f, 0f, 0f, 0f, 0f };
+        await baseline.UpsertAsync(
+        [
+            new CosineDocument { Id = "orthogonal", Embedding = orthogonal },
+            new CosineDocument { Id = "aligned", Embedding = direction }
+        ], cancellationToken);
+        await scaled.UpsertAsync(
+        [
+            new CosineDocument { Id = "orthogonal", Embedding = orthogonal },
+            new CosineDocument { Id = "aligned", Embedding = tiny }
+        ], cancellationToken);
+
+        var expected = await ToListAsync(baseline.SearchAsync(direction, 2, cancellationToken: cancellationToken));
+        var tinyQuery = await ToListAsync(baseline.SearchAsync(tiny, 2, cancellationToken: cancellationToken));
+        var tinyStoredVector = await ToListAsync(scaled.SearchAsync(direction, 2, cancellationToken: cancellationToken));
+
+        Assert.Equal("aligned", expected[0].Record.Id);
+        Assert.Equal(expected.Select(result => result.Record.Id), tinyQuery.Select(result => result.Record.Id));
+        Assert.Equal(expected.Select(result => result.Record.Id), tinyStoredVector.Select(result => result.Record.Id));
+        var expectedScore = Assert.IsType<double>(expected[0].Score);
+        var queryScore = Assert.IsType<double>(tinyQuery[0].Score);
+        var storedScore = Assert.IsType<double>(tinyStoredVector[0].Score);
+        Assert.True(useDistance ? queryScore < 0.2 : queryScore > 0.8);
+        Assert.True(useDistance ? storedScore < 0.2 : storedScore > 0.8);
+        Assert.InRange(Math.Abs(expectedScore - queryScore), 0, 1e-5);
+        Assert.InRange(Math.Abs(expectedScore - storedScore), 0, 1e-5);
+        Assert.Equal(magnitude, tiny[0]);
+        Assert.Equal(magnitude, tiny[1]);
+    }
+
+    [Fact]
+    public async Task CosineSearchAcceptsZeroVectors()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var store = new InMemoryVectorStore();
+        var collection = store.GetCollection("zero", TestMappings.CosineDocument);
+        var zero = new float[8];
+        await collection.UpsertAsync(new CosineDocument { Id = "zero", Embedding = zero }, cancellationToken);
+
+        var result = Assert.Single(await ToListAsync(collection.SearchAsync(zero, 1, cancellationToken: cancellationToken)));
+
+        Assert.Equal(0d, result.Score);
+        Assert.All(zero, value => Assert.Equal(0f, value));
     }
 
     [Fact]
@@ -227,6 +407,16 @@ public sealed class TurboQuantVectorStoreTests : IDisposable
         Assert.Equal(7, withoutVector["Rank"]);
         Assert.False(withoutVector.ContainsKey("Embedding"));
         Assert.False(withoutVector.ContainsKey("embedding"));
+
+        var ordered = await ToListAsync(collection.GetAsync(
+            record => (int)record["Rank"]! == 7, 1,
+            new FilteredRecordRetrievalOptions<Dictionary<string, object?>>
+            {
+                OrderBy = orderBy => orderBy.Descending(
+                    record => ((ReadOnlyMemory<float>)record["Embedding"]!).ToArray()[0])
+            }, cancellationToken));
+        Assert.Equal("dynamic-1", Assert.Single(ordered)["Id"]);
+        Assert.False(ordered[0].ContainsKey("Embedding"));
 
         List<VectorSearchResult<Dictionary<string, object?>>> results = await ToListAsync(collection.SearchAsync(
             new ReadOnlyMemory<float>(Axis0), 1,
@@ -643,6 +833,68 @@ public sealed class TurboQuantVectorStoreTests : IDisposable
 
         Assert.NotEqual(Guid.Empty, document.Id);
         Assert.NotNull(await collection.GetAsync(document.Id, cancellationToken: cancellationToken));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DynamicGuidKeysAreNotGeneratedWhenDisabled(bool omitKey)
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var definition = new VectorStoreCollectionDefinition
+        {
+            Properties =
+            [
+                new VectorStoreKeyProperty("Id", typeof(Guid)) { IsAutoGenerated = false },
+                new VectorStoreVectorProperty("Embedding", typeof(float[]), 8)
+            ]
+        };
+        var store = new InMemoryVectorStore();
+        var collection = store.GetDynamicCollection("guids", definition);
+        var record = new Dictionary<string, object?> { ["Embedding"] = Axis0 };
+        if (!omitKey)
+        {
+            record["Id"] = null;
+        }
+
+        await Assert.ThrowsAsync<ArgumentException>(() => collection.UpsertAsync(record, cancellationToken));
+        Assert.False(record.TryGetValue("Id", out var value) && value is not null);
+        Assert.False(await collection.CollectionExistsAsync(cancellationToken));
+
+        record["Id"] = Guid.Empty;
+        await collection.UpsertAsync(record, cancellationToken);
+        Assert.Equal(Guid.Empty, record["Id"]);
+        Assert.NotNull(await collection.GetAsync(Guid.Empty, cancellationToken: cancellationToken));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task DynamicGuidKeysAreGeneratedWhenEnabled(int keyKind)
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var definition = new VectorStoreCollectionDefinition
+        {
+            Properties =
+            [
+                new VectorStoreKeyProperty("Id", typeof(Guid)) { IsAutoGenerated = true },
+                new VectorStoreVectorProperty("Embedding", typeof(float[]), 8)
+            ]
+        };
+        var store = new InMemoryVectorStore();
+        var collection = store.GetDynamicCollection("guids", definition);
+        var record = new Dictionary<string, object?> { ["Embedding"] = Axis0 };
+        if (keyKind != 0)
+        {
+            record["Id"] = keyKind == 2 ? Guid.Empty : null;
+        }
+
+        await collection.UpsertAsync(record, cancellationToken);
+
+        var id = Assert.IsType<Guid>(record["Id"]);
+        Assert.NotEqual(Guid.Empty, id);
+        Assert.NotNull(await collection.GetAsync(id, cancellationToken: cancellationToken));
     }
 
     [Fact]

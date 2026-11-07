@@ -71,12 +71,12 @@ using TurboVector;
 var index = new TurboQuantIndex(dim: 256, bitWidth: 4);
 
 // Add vectors (flat row-major float array, length = n * dim)
-float[] vectors = LoadYourVectors(); // shape [n, 256]
+var vectors = LoadYourVectors(); // shape [n, 256]
 index.Add(vectors);
 
 // Search — returns top-k results for each query
-float[] query = LoadYourQuery();     // length 256
-SearchResults results = index.Search(query, k: 10);
+var query = LoadYourQuery();     // length 256
+var results = index.Search(query, k: 10);
 
 Console.WriteLine($"Best match: slot {results.Indices[0]}, score {results.Scores[0]:F4}");
 
@@ -84,7 +84,7 @@ Console.WriteLine($"Best match: slot {results.Indices[0]}, score {results.Scores
 index.Write("my_index.tv");
 
 // Reload
-TurboQuantIndex loaded = TurboQuantIndex.Load("my_index.tv");
+var loaded = TurboQuantIndex.Load("my_index.tv");
 ```
 
 For stable external IDs (e.g. database row IDs):
@@ -108,7 +108,7 @@ idMap.Write("my_index.tvim");
 | **Codebook** | Lloyd-Max boundaries and centroids for a Beta((d−1)/2,(d−1)/2) distribution, matching the pinned Rust numerical procedure. Depends only on `bitWidth` and `dim` — reusable across indexes. |
 | **Encode** | Each vector is L2-normalised → rotated → optionally TQ+ calibrated → thermometer-coded against the boundaries → bit-packed. A correction scale is stored per vector. |
 | **Pack** | Codes are transposed into a blocked layout (32-vector blocks × byte-groups) for cache-friendly SIMD scoring. |
-| **Search** | A uint8 look-up table maps quantized query×centroid products. The score accumulator is `scale × acc + bias`, multiplied by the per-vector correction scale. |
+| **Search** | Hardware-specific lookup-table or int8 dot-product scoring, with staged sign-plane shortlisting for eligible large indexes. The per-vector correction scale is applied to each score. |
 
 ## Bit Width Trade-offs
 
@@ -129,6 +129,8 @@ idMap.Write("my_index.tvim");
 
 The index uses a deterministic block-Hadamard rotation for encoding and search, avoiding a dense dimension-by-dimension rotation matrix. The rotation uses AVX where available; the dense-matrix overloads use [`System.Numerics.Tensors.TensorPrimitives`](https://learn.microsoft.com/en-us/dotnet/api/system.numerics.tensors.tensorprimitives). Recalibration processes stored rows in bounded chunks rather than allocating a full-size floating-point reconstruction.
 
+Search arithmetic and approximate shortlisting follow the Rust implementation's hardware-dependent paths. Scores and tied result IDs can therefore differ between hardware, thread counts, and upstream Rust versions. See the [library search notes](src/TurboVector/README.md#search-behavior-and-runtime-switches) for the applicable switches.
+
 ## Project READMEs
 
 - [Library — `src/TurboVector`](src/TurboVector/README.md)
@@ -139,4 +141,4 @@ The index uses a deterministic block-Hadamard rotation for encoding and search, 
 
 ## Credits
 
-Ported from the Rust [`turbovec`](https://github.com/RyanCodrai/turbovec) crate by RyanCodrai, itself an implementation of the RaBitQ algorithm.
+Ported from the Rust [`turbovec`](https://github.com/RyanCodrai/turbovec) crate by RyanCodrai, itself an implementation of the RaBitQ algorithm. See [third-party notices](THIRD-PARTY-NOTICES.md) for its license.

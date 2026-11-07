@@ -14,6 +14,8 @@
 
   <ItemGroup>
     <PackageReference Include="System.Numerics.Tensors" />
+    <InternalsVisibleTo Include="TurboVector.Tests" />
+    <None Include="..\..\THIRD-PARTY-NOTICES.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>

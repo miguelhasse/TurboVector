@@ -115,27 +115,27 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
             yield break;
         }
 
-        int requestedSkip = options?.Skip ?? 0;
+        var requestedSkip = options?.Skip ?? 0;
         ArgumentOutOfRangeException.ThrowIfNegative(requestedSkip);
-        bool includeVectors = options?.IncludeVectors == true;
-        Func<TRecord, bool> predicate = filter.Compile();
-        List<TRecord> result = [];
+        var includeVectors = options?.IncludeVectors == true;
+        var predicate = filter.Compile();
+        var result = new List<(TRecord? Record, string Json)>();
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            State? state = await LoadIfExistsAsync(cancellationToken).ConfigureAwait(false);
+            var state = await LoadIfExistsAsync(cancellationToken).ConfigureAwait(false);
             if (state is null)
             {
                 yield break;
             }
 
-            foreach (string json in state.Records.Values)
+            foreach (var json in state.Records.Values)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                TRecord record = _accessor.Deserialize(json, includeVectors: true);
+                var record = _accessor.Deserialize(json, includeVectors: true);
                 if (predicate(record))
                 {
-                    result.Add(includeVectors ? record : _accessor.Deserialize(json, includeVectors: false));
+                    result.Add((includeVectors ? record : null, json));
                 }
             }
         }
@@ -144,11 +144,11 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
             _gate.Release();
         }
 
-        IEnumerable<TRecord> ordered = ApplyOrdering(result, options?.OrderBy);
-        foreach (TRecord record in ordered.Skip(requestedSkip).Take(top))
+        var ordered = ApplyOrdering(result, options?.OrderBy, cancellationToken);
+        foreach (var match in ordered.Skip(requestedSkip).Take(top))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            yield return record;
+            yield return match.Record ?? _accessor.Deserialize(match.Json, includeVectors: false);
         }
     }
 
@@ -437,30 +437,57 @@ public sealed class TurboQuantCollection<TKey, TRecord> : VectorStoreCollection<
 
     private static string IdKey(ulong id) => id.ToString(CultureInfo.InvariantCulture);
 
-    private static IEnumerable<TRecord> ApplyOrdering(
-        IEnumerable<TRecord> records,
-        Func<FilteredRecordRetrievalOptions<TRecord>.OrderByDefinition, FilteredRecordRetrievalOptions<TRecord>.OrderByDefinition>? orderByFactory)
+    private IEnumerable<(TRecord? Record, string Json)> ApplyOrdering(
+        IReadOnlyList<(TRecord? Record, string Json)> records,
+        Func<FilteredRecordRetrievalOptions<TRecord>.OrderByDefinition, FilteredRecordRetrievalOptions<TRecord>.OrderByDefinition>? orderByFactory,
+        CancellationToken cancellationToken)
     {
         if (orderByFactory is null)
         {
             return records;
         }
 
-        IOrderedEnumerable<TRecord>? ordered = null;
-        var orderBy = orderByFactory(new FilteredRecordRetrievalOptions<TRecord>.OrderByDefinition());
-        foreach (FilteredRecordRetrievalOptions<TRecord>.OrderByDefinition.SortInfo sort in orderBy.Values)
+        var sorts = orderByFactory(new FilteredRecordRetrievalOptions<TRecord>.OrderByDefinition()).Values;
+        if (sorts.Count == 0)
         {
-            Func<TRecord, object?> selector = sort.PropertySelector.Compile();
-            ordered = ordered is null
-                ? sort.Ascending
-                    ? records.OrderBy(selector, Comparer<object?>.Default)
-                    : records.OrderByDescending(selector, Comparer<object?>.Default)
-                : sort.Ascending
-                    ? ordered.ThenBy(selector, Comparer<object?>.Default)
-                    : ordered.ThenByDescending(selector, Comparer<object?>.Default);
+            return records;
         }
 
-        return ordered ?? records;
+        var selectors = new Func<TRecord, object?>[sorts.Count];
+        var keys = new object?[sorts.Count][];
+        for (var i = 0; i < sorts.Count; i++)
+        {
+            selectors[i] = sorts[i].PropertySelector.Compile();
+            keys[i] = new object?[records.Count];
+        }
+
+        // Keep sort keys, rather than every vector, alive until pagination is complete.
+        for (var i = 0; i < records.Count; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var record = records[i].Record ?? _accessor.Deserialize(records[i].Json, includeVectors: true);
+            for (var sortIndex = 0; sortIndex < selectors.Length; sortIndex++)
+            {
+                keys[sortIndex][i] = selectors[sortIndex](record);
+            }
+        }
+
+        var indices = Enumerable.Range(0, records.Count);
+        var ordered = default(IOrderedEnumerable<int>);
+        for (var i = 0; i < sorts.Count; i++)
+        {
+            var column = keys[i];
+            var sort = sorts[i];
+            ordered = ordered is null
+                ? sort.Ascending
+                    ? indices.OrderBy(index => column[index], Comparer<object?>.Default)
+                    : indices.OrderByDescending(index => column[index], Comparer<object?>.Default)
+                : sort.Ascending
+                    ? ordered.ThenBy(index => column[index], Comparer<object?>.Default)
+                    : ordered.ThenByDescending(index => column[index], Comparer<object?>.Default);
+        }
+
+        return (ordered ?? indices).Select(index => records[index]);
     }
 
     private sealed class State(IdMapIndex index, Dictionary<string, ulong> keyToId, Dictionary<string, string> records, ulong nextId)

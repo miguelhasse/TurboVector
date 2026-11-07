@@ -130,7 +130,7 @@ IdMapIndex loaded = IdMapIndex.Load(string path);
 | `TqPlusCalibration.cs` | Fits deterministic per-coordinate shift/scale values from a representative sample |
 | `Encode.cs` | Normalize → rotate → calibrate → thermometer-code → pack → compute correction scales |
 | `Pack.cs` | Transpose packed codes into SIMD-friendly blocked layout (32-vector blocks) |
-| `Search.cs` | LUT-based scored search for 2-bit, 3-bit, and 4-bit codes; min-heap top-k |
+| `Search*.cs` | Hardware-dispatched lookup-table and dot-product scoring, staged plane search, and top-k selection |
 | `Io.cs`, `PersistenceV8.cs` | Rust-compatible v8 snapshots, v7/v8 loading, calibration, stream and byte APIs |
 
 ### `Encoder.Encode` pipeline (hot path)
@@ -139,7 +139,7 @@ IdMapIndex loaded = IdMapIndex.Load(string path);
 vectors (float[], n×dim)
    │
    ├─ Loop A: TensorPrimitives.Norm + Multiply  → unit (L2-normalised rows)
-   ├─ Loop B: TensorPrimitives.Dot per row      → rotated (after orthogonal rotation)
+   ├─ Loop B: deterministic block-Hadamard transform → rotated
    ├─ Loop C: thermometer-code vs boundaries    → codes (byte, 0…levels-1)
    ├─ Loop D: dot(rotated, centroid[codes])     → correction scales
    └─ PackCodes: bit-plane packing             → packed (byte[], n × bitWidth × dim/8)
@@ -150,16 +150,30 @@ vectors (float[], n×dim)
 ```
 queries (float[], nq×dim)
    │
-   └─ TensorPrimitives.Dot per row × dim       → rotated queries (SIMD, 4–8× vs scalar)
+   └─ deterministic block-Hadamard transform → rotated queries
 ```
 
 ### Scoring kernel (per candidate vector)
 
 ```
 acc = Σ_g lut[g_offset + nibble(packed[g])]   // LUT lookup, byte accumulation
-score = scale * acc + bias                     // dequantise
+score = scale * acc + bias                     // dequantise, with kernel-specific rounding
 score *= vecScale[vecIdx]                      // per-vector correction
 ```
+
+## Search behavior and runtime switches
+
+The classic path builds per-subtable uint8 lookups using the Rust implementation's 127-level scale; vector-major paths use the corresponding integer accumulation or 4-bit signed int8 dot-product arithmetic. Eligible 2-bit and 4-bit indexes with at least 32,768 vectors use a sign-plane shortlist followed by low-plane refinement and exact quantized rescoring. These stages are approximate: their candidate set, floating-point score bits, and tied IDs can differ across architectures, worker counts, or Rust compiler versions. The current fixtures are based on upstream commit `c3b043b992290ff223b903046af7f6683768241c`.
+
+The following environment variables are read once per process:
+
+| Variable | Effect |
+|----------|--------|
+| `TURBOVEC_NO_VECTOR_MAJOR`, `TURBOVEC_NO_VNNI` | Any value other than `0` disables vector-major search. |
+| `TURBOVEC_2BIT_PLANES`, `TURBOVEC_4BIT_PLANES` | Set to `0` to disable the corresponding staged search. |
+| `TURBOVEC_2BIT_VM8` | Set to `1` to opt in to ARM64 2-bit dot-product batches when i8mm and the required geometry are available. As upstream does, this switch disables staged planes on ARM64 for both widths. |
+| `TURBOVEC_NO_I8MM` | Any set value disables the ARM64 2-bit i8mm-gated path. |
+| `RAYON_NUM_THREADS` | A positive integer selects the upstream-compatible staged-search partition count; it does not set the .NET thread-pool size. |
 
 ---
 

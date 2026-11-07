@@ -93,4 +93,44 @@ public class SearchOrderingParityTests
         Assert.Equal(indices, calibratedIndices);
         Assert.NotEqual(scores[0], calibratedScores[0]);
     }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void LowLevelSearchRejectsMissingVectorBlocks(int bitWidth)
+    {
+        const int dim = 8;
+        const int vectorCount = 33;
+        const int blockCount = 1;
+        var query = new float[] { 1f, 0f, 0f, 0f, 0f, 0f, 0f, 0f };
+        var rotation = Rotation.MakeRotationMatrix(dim);
+        var centroids = Codebook.Compute(bitWidth, dim).Centroids;
+        var scales = Enumerable.Repeat(1f, vectorCount).ToArray();
+
+        if (bitWidth == 3)
+        {
+            var subCodes = new byte[blockCount * (dim / 4) * 32];
+            var plane = new byte[blockCount * (dim / 8) * 32];
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                Search.Search3Bit_(query, 1, rotation, subCodes, plane, centroids, scales,
+                    dim, vectorCount, blockCount, vectorCount, null, 0));
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                Search.Search3Bit_(query, 1, rotation, subCodes.AsSpan(), plane.AsSpan(), centroids, scales,
+                    dim, vectorCount, blockCount, vectorCount, ReadOnlySpan<ulong>.Empty));
+        }
+        else
+        {
+            var blocked = new byte[blockCount * (dim / (8 / bitWidth)) * 32];
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                Search.Search_(query, 1, rotation, blocked, centroids, scales,
+                    bitWidth, dim, vectorCount, blockCount, vectorCount, null, 0, [], []));
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                Search.Search_(query, 1, rotation, blocked, centroids, scales,
+                    bitWidth, dim, vectorCount, blockCount, vectorCount, null, 0));
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                Search.Search_(query, 1, rotation, blocked.AsSpan(), centroids, scales,
+                    bitWidth, dim, vectorCount, blockCount, vectorCount, ReadOnlySpan<ulong>.Empty));
+        }
+    }
 }

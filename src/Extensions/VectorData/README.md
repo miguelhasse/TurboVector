@@ -65,7 +65,7 @@ internal static class ArticleMapping
 }
 ```
 
-- `SetKey` is optional; supply it for `Guid` keys so `UpsertAsync` can assign generated keys.
+- `SetKey` is optional; supply it for automatically generated `Guid` keys so `UpsertAsync` can assign them. When key generation is disabled, a key must be supplied.
 - Required vector properties are returned empty when vectors are excluded. For a custom vector type or converter that cannot deserialize an empty JSON array, set `CreateEmptyVector` to a factory returning an empty value of the declared vector type.
 - If a property's JSON name differs from the name produced by the record metadata's naming policy (for example via `[JsonPropertyName]`), set `StorageName` on the definition property. Mappings are validated against the `JsonTypeInfo` when a collection is created.
 - To use the standard `VectorStore.GetCollection<TKey, TRecord>(name)` API, register the mapping once: `store.RegisterRecordMapping(ArticleMapping.Instance)`. That API is annotated as requiring dynamic code by Microsoft.Extensions.VectorData itself, so AOT applications should prefer the `GetCollection(name, mapping)` overload. Unregistered record types throw `InvalidOperationException`.
@@ -89,8 +89,8 @@ The vector property must use a supported float vector type (`ReadOnlyMemory<floa
 - `TurboQuantFileSystemVectorStore` names files by the SHA-256 of the collection name, writes a sibling temporary file and atomically replaces the image. Store instances in the same process share per-file locks. Do not write to the same directory from multiple processes concurrently.
 - Collections are loaded lazily when accessed. `EnsureCollectionExistsAsync` creates an empty collection; reopening the store with the same storage and schema restores its records.
 - The store defaults to 4-bit quantization. Supported widths are 2, 3, and 4 bits.
-- Predicate filters and filtered-retrieval ordering are evaluated against loaded records in process.
-- The default score is TurboVector's dot-product similarity. Negative dot-product similarity and cosine similarity/distance are also supported. Cosine modes normalize copies of vectors during indexing and search; caller-supplied arrays are not modified. Other distance functions are rejected.
+- Predicate filters and filtered-retrieval ordering are evaluated against complete loaded records in process, before vectors are omitted from results.
+- The default score is TurboVector's dot-product similarity. Negative dot-product similarity and cosine similarity/distance are also supported. Cosine modes normalize copies of nonzero vectors during indexing and search, including very small vectors; zero vectors remain zero and caller-supplied arrays are not modified. Other distance functions are rejected.
 - Search accepts float vectors directly. `IncludeVectors` controls whether returned records retain vector values.
 
 ## Migrating from earlier versions

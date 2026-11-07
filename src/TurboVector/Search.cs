@@ -1,13 +1,15 @@
 using System.Buffers;
 using System.Numerics;
 using System.Numerics.Tensors;
+using System.Runtime.Intrinsics.Arm;
+using System.Runtime.Intrinsics.X86;
 
 namespace TurboVector;
 
 /// <summary>
 /// Quantized similarity search over blocked codebooks.
 /// </summary>
-public static class Search
+public static partial class Search
 {
     private static long _blocksSkippedByMask;
 
@@ -123,7 +125,8 @@ public static class Search
         ulong[]? mask,
         int maskLength,
         float[] tqplusShift,
-        float[] tqplusScale)
+        float[] tqplusScale,
+        PlanesCache? planes = null)
     {
         ArgumentNullException.ThrowIfNull(rotation);
         ArgumentNullException.ThrowIfNull(blockedCodes);
@@ -143,21 +146,16 @@ public static class Search
         }
         ValidateCalibration(dim, tqplusShift, tqplusScale);
 
-        if (bitWidth == 3)
-        {
-            throw new NotSupportedException("Use Search3Bit_ for blocked 3-bit codes.");
-        }
-
         int nByteGroups = GetNByteGroups(bitWidth, dim);
         int expectedLength = checked(nBlocks * nByteGroups * Constants.Block);
-        if (blockedCodes.Length != expectedLength)
+        if (planes is null && blockedCodes.Length != expectedLength)
         {
             throw new ArgumentException($"Expected blockedCodes length {expectedLength}, got {blockedCodes.Length}.", nameof(blockedCodes));
         }
 
         return RunBlockedNibbleSearch(
             queries, nq, default, blockedCodes, centroids, vecScales, bitWidth,
-            dim, nVectors, nBlocks, k, mask, maskLength, rotation, tqplusShift, tqplusScale);
+            dim, nVectors, nBlocks, k, mask, maskLength, rotation, tqplusShift, tqplusScale, planes);
     }
 
     public static (float[] Scores, long[] Indices) Search_(
@@ -434,15 +432,15 @@ public static class Search
             throw new ArgumentException($"Expected packedCodes length {expectedPackedLength}, got {packedCodes.Length}.", nameof(packedCodes));
         }
 
-        var (subCodes, plane2Blocked, nBlocks) = Pack.Repack3Bit(packedCodes, nVectors, dim);
-        return RunBlocked3BitSearch(
+        var (blocked, nBlocks) = Pack.Repack(packedCodes, nVectors, 3, dim);
+        return RunBlockedNibbleSearch(
             queries,
             nq,
             rotation,
-            subCodes,
-            plane2Blocked,
+            blocked,
             centroids.ToArray(),
             vecScales.ToArray(),
+            3,
             dim,
             nVectors,
             nBlocks,
@@ -467,8 +465,10 @@ public static class Search
         int maskLength,
         Rotation? rotationPlan = null,
         float[]? tqplusShift = null,
-        float[]? tqplusScale = null)
+        float[]? tqplusScale = null,
+        PlanesCache? planes = null)
     {
+        ValidateBlockCoverage(nVectors, nBlocks);
         ReadOnlySpan<ulong> maskSpan = mask is null ? ReadOnlySpan<ulong>.Empty : mask.AsSpan(0, maskLength);
 
         // Compute effectiveK and allocate result arrays BEFORE the expensive rotation so
@@ -483,9 +483,16 @@ public static class Search
         }
 
         int nByteGroups = GetNByteGroups(bitWidth, dim);
-        ReadOnlySpan<byte> blockedSpan = blockedCodes.AsSpan(0, checked(nBlocks * nByteGroups * Constants.Block));
+        var blockedSpan = planes is null
+            ? blockedCodes.AsSpan(0, checked(nBlocks * nByteGroups * Constants.Block))
+            : Span<byte>.Empty;
         ReadOnlySpan<float> vecScalesSpan = vecScales.AsSpan(0, nVectors);
         ReadOnlySpan<float> centroidsSpan = centroids;
+        if (planes is null && UsePlanes(bitWidth, nByteGroups, nVectors))
+        {
+            planes = BuildPlanesCache(blockedSpan, centroidsSpan, tqplusShift, tqplusScale,
+                bitWidth, dim, nVectors, nBlocks);
+        }
 
         int rotSize = checked(nq * dim);
         float[]? rotBuf = ArrayPool<float>.Shared.Rent(rotSize);
@@ -508,82 +515,63 @@ public static class Search
             // or < 8 longs fit in one 64-byte cache line, causing cross-thread contention).
             var perQueryScores = new float[nq][];
             var perQueryIndices = new int[nq][];
-            int lutSize = bitWidth switch
-            {
-                2 => checked(nByteGroups * 16),
-                4 => checked(nByteGroups * 32),
-                _ => throw new NotSupportedException("Nibble search only supports 2-bit or 4-bit codes."),
-            };
+            var vectorMajor = UseVectorMajor(bitWidth, nByteGroups);
+            var planeThreads = planes is null ? 1 : UpstreamThreadCount();
+            var arm64 = AdvSimd.Arm64.IsSupported;
 
             // Avoid Parallel.For scheduling overhead for single-query searches.
             if (nq == 1)
             {
-                byte[] lut = ArrayPool<byte>.Shared.Rent(lutSize);
-                try
-                {
-                    var qRot = new ReadOnlySpan<float>(rotatedQueries, 0, dim);
-                    var lutSpan = lut.AsSpan(0, lutSize);
-                    var (scale, bias) = bitWidth switch
-                    {
-                        2 => BuildLut2BitInto(qRot, centroidsSpan, lutSpan),
-                        4 => BuildLut4BitInto(qRot, centroidsSpan, lutSpan),
-                        _ => throw new NotSupportedException("Nibble search only supports 2-bit or 4-bit codes."),
-                    };
-                    if (biasCorrections is not null)
-                    {
-                        bias += biasCorrections[0];
-                    }
-
-                    var (scores, indices) = bitWidth switch
-                    {
-                        2 => Score2Bit(blockedSpan, lut, scale, bias, vecScalesSpan, dim, nVectors, nBlocks, effectiveK, maskSpan),
-                        4 => Score4Bit(blockedSpan, lut, scale, bias, vecScalesSpan, dim, nVectors, nBlocks, effectiveK, maskSpan),
-                        _ => throw new NotSupportedException("Nibble search only supports 2-bit or 4-bit codes."),
-                    };
-                    perQueryScores[0] = scores;
-                    perQueryIndices[0] = indices;
-                }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(lut);
-                }
+                var qRot = new ReadOnlySpan<float>(rotatedQueries, 0, dim);
+                var (scores, indices) = planes is null
+                    ? ScoreBlockedQuery(qRot, blockedSpan, centroidsSpan, vecScalesSpan, bitWidth, nByteGroups,
+                        nVectors, nBlocks, effectiveK, maskSpan, biasCorrections?[0] ?? 0f, vectorMajor, false)
+                    : ScorePlanesQuery(qRot, centroidsSpan, vecScalesSpan, planes, bitWidth,
+                        nVectors, nBlocks, effectiveK, maskSpan, biasCorrections?[0] ?? 0f,
+                        tqplusShift, tqplusScale, nq, planeThreads, arm64);
+                perQueryScores[0] = scores;
+                perQueryIndices[0] = indices;
             }
             else
             {
+                var shortQueries = planes is not null && maskSpan.IsEmpty ? new bool[nq] : null;
                 Parallel.For(0, nq, qi =>
                 {
-                    byte[] lut = ArrayPool<byte>.Shared.Rent(lutSize);
-                    try
-                    {
-                        var qRot = new ReadOnlySpan<float>(rotatedQueries, qi * dim, dim);
-                        var lutSpan = lut.AsSpan(0, lutSize);
-                        var qMask = mask is null ? ReadOnlySpan<ulong>.Empty : mask.AsSpan(0, maskLength);
-                        var (scale, bias) = bitWidth switch
-                        {
-                            2 => BuildLut2BitInto(qRot, centroids, lutSpan),
-                            4 => BuildLut4BitInto(qRot, centroids, lutSpan),
-                            _ => throw new NotSupportedException("Nibble search only supports 2-bit or 4-bit codes."),
-                        };
-                        if (biasCorrections is not null)
-                        {
-                            bias += biasCorrections[qi];
-                        }
-
-                        var (scores, indices) = bitWidth switch
-                        {
-                            2 => Score2Bit(blockedCodes, lut, scale, bias, vecScales, dim, nVectors, nBlocks, effectiveK, qMask),
-                            4 => Score4Bit(blockedCodes, lut, scale, bias, vecScales, dim, nVectors, nBlocks, effectiveK, qMask),
-                            _ => throw new NotSupportedException("Nibble search only supports 2-bit or 4-bit codes."),
-                        };
-
-                        perQueryScores[qi] = scores;
-                        perQueryIndices[qi] = indices;
-                    }
-                    finally
-                    {
-                        ArrayPool<byte>.Shared.Return(lut);
-                    }
+                    var qRot = new ReadOnlySpan<float>(rotatedQueries, qi * dim, dim);
+                    var qMask = mask is null ? ReadOnlySpan<ulong>.Empty : mask.AsSpan(0, maskLength);
+                    var (scores, indices) = planes is null
+                        ? ScoreBlockedQuery(qRot, blockedCodes, centroids, vecScales, bitWidth, nByteGroups,
+                            nVectors, nBlocks, effectiveK, qMask, biasCorrections?[qi] ?? 0f, vectorMajor,
+                            bitWidth == 2 && IsArmPermuteBatch(qi, nq) && UseArm2BitPermuteDot(nByteGroups))
+                        : ScorePlanesQuery(qRot, centroids, vecScales, planes, bitWidth,
+                            nVectors, nBlocks, effectiveK, qMask, biasCorrections?[qi] ?? 0f,
+                            tqplusShift, tqplusScale, nq, planeThreads, arm64, shortQueries, qi);
+                    perQueryScores[qi] = scores;
+                    perQueryIndices[qi] = indices;
                 });
+
+                if (shortQueries is not null)
+                {
+                    var rescanQueries = 0;
+                    foreach (var isShort in shortQueries)
+                    {
+                        if (isShort) rescanQueries++;
+                    }
+
+                    if (rescanQueries > 0)
+                    {
+                        Parallel.For(0, nq, qi =>
+                        {
+                            if (!shortQueries[qi]) return;
+                            var qRot = new ReadOnlySpan<float>(rotatedQueries, qi * dim, dim);
+                            var (scores, indices) = ScorePlanesQuery(qRot, centroids, vecScales, planes!, bitWidth,
+                                nVectors, nBlocks, effectiveK, [], biasCorrections?[qi] ?? 0f,
+                                tqplusShift, tqplusScale, nq, planeThreads, arm64, shortQueries, qi, rescanQueries);
+                            perQueryScores[qi] = scores;
+                            perQueryIndices[qi] = indices;
+                        });
+                    }
+                }
             }
 
             for (int qi = 0; qi < nq; qi++)
@@ -622,112 +610,80 @@ public static class Search
         float[]? tqplusShift = null,
         float[]? tqplusScale = null)
     {
-        ReadOnlySpan<ulong> maskSpan = mask is null ? ReadOnlySpan<ulong>.Empty : mask.AsSpan(0, maskLength);
+        ValidateBlockCoverage(nVectors, nBlocks);
+        var maskSpan = mask is null ? ReadOnlySpan<ulong>.Empty : mask.AsSpan(0, maskLength);
+        if (nq == 0 || GetEffectiveK(nVectors, k, maskSpan) == 0) return ([], []);
 
-        // Compute effectiveK and allocate result arrays BEFORE the expensive rotation so
-        // that we short-circuit early and also catch any overflow before doing work.
-        int effectiveK = GetEffectiveK(nVectors, k, maskSpan);
-        float[] allScores = new float[checked(nq * effectiveK)];
-        long[] allIndices = new long[checked(nq * effectiveK)];
-
-        if (effectiveK == 0)
-        {
-            return (allScores, allIndices);
-        }
-
-        ReadOnlySpan<byte> subCodesSpan = subCodes.AsSpan(0, checked(nBlocks * (dim / 4) * Constants.Block));
-        ReadOnlySpan<byte> plane2BlockedSpan = plane2Blocked.AsSpan(0, checked(nBlocks * (dim / 8) * Constants.Block));
-        ReadOnlySpan<float> vecScalesSpan = vecScales.AsSpan(0, nVectors);
-        ReadOnlySpan<float> centroidsSpan = centroids;
-
-        int rotSize = checked(nq * dim);
-        float[]? rotBuf = ArrayPool<float>.Shared.Rent(rotSize);
+        var length = checked(nBlocks * (dim / 2) * Constants.Block);
+        var blocked = ArrayPool<byte>.Shared.Rent(length);
         try
         {
-            if (rotationPlan is null)
-            {
-                FillRotatedQueries(queries, nq, dim, rotation, rotBuf.AsSpan(0, rotSize));
-            }
-            else
-            {
-                FillRotatedQueries(queries, nq, dim, rotationPlan, rotBuf.AsSpan(0, rotSize));
-            }
-            float[]? biasCorrections = ApplyQueryCalibration(
-                rotBuf, nq, dim, tqplusShift, tqplusScale);
-            float[] rotatedQueries = rotBuf; // alias; Parallel.For is synchronous so safe to return after
-
-            // Collect results into per-query local arrays inside the parallel loop to avoid
-            // false sharing on allScores/allIndices when effectiveK is small.
-            var perQueryScores = new float[nq][];
-            var perQueryIndices = new int[nq][];
-            int lutSize = checked(dim * 8);
-
-            // Avoid Parallel.For scheduling overhead for single-query searches.
-            if (nq == 1)
-            {
-                byte[] lut = ArrayPool<byte>.Shared.Rent(lutSize);
-                try
-                {
-                    var qRot = new ReadOnlySpan<float>(rotatedQueries, 0, dim);
-                    var lutSpan = lut.AsSpan(0, lutSize);
-                    var (scale, bias) = BuildLut3BitInto(qRot, centroidsSpan, lutSpan);
-                    if (biasCorrections is not null)
-                    {
-                        bias += biasCorrections[0];
-                    }
-
-                    var (scores, indices) = Score3Bit(subCodesSpan, plane2BlockedSpan, lut, scale, bias, vecScalesSpan, dim, nVectors, nBlocks, effectiveK, maskSpan);
-                    perQueryScores[0] = scores;
-                    perQueryIndices[0] = indices;
-                }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(lut);
-                }
-            }
-            else
-            {
-                Parallel.For(0, nq, qi =>
-                {
-                    byte[] lut = ArrayPool<byte>.Shared.Rent(lutSize);
-                    try
-                    {
-                        var qRot = new ReadOnlySpan<float>(rotatedQueries, qi * dim, dim);
-                        var lutSpan = lut.AsSpan(0, lutSize);
-                        var qMask = mask is null ? ReadOnlySpan<ulong>.Empty : mask.AsSpan(0, maskLength);
-                        var (scale, bias) = BuildLut3BitInto(qRot, centroids, lutSpan);
-                        if (biasCorrections is not null)
-                        {
-                            bias += biasCorrections[qi];
-                        }
-
-                        var (scores, indices) = Score3Bit(subCodes, plane2Blocked, lut, scale, bias, vecScales, dim, nVectors, nBlocks, effectiveK, qMask);
-                        perQueryScores[qi] = scores;
-                        perQueryIndices[qi] = indices;
-                    }
-                    finally
-                    {
-                        ArrayPool<byte>.Shared.Return(lut);
-                    }
-                });
-            }
-
-            for (int qi = 0; qi < nq; qi++)
-            {
-                Array.Copy(perQueryScores[qi], 0, allScores, qi * effectiveK, effectiveK);
-                int[] qIdx = perQueryIndices[qi];
-                for (int i = 0; i < effectiveK; i++)
-                {
-                    allIndices[(qi * effectiveK) + i] = qIdx[i];
-                }
-            }
+            Pack.Expand3BitBlocked(subCodes, plane2Blocked, dim, nBlocks, blocked.AsSpan(0, length));
+            return RunBlockedNibbleSearch(
+                queries, nq, rotation, blocked, centroids, vecScales, 3, dim,
+                nVectors, nBlocks, k, mask, maskLength, rotationPlan, tqplusShift, tqplusScale);
         }
         finally
         {
-            ArrayPool<float>.Shared.Return(rotBuf);
+            ArrayPool<byte>.Shared.Return(blocked);
+        }
+    }
+
+    private static void ValidateBlockCoverage(int nVectors, int nBlocks)
+    {
+        var requiredBlocks = nVectors / Constants.Block + (nVectors % Constants.Block == 0 ? 0 : 1);
+        if (nBlocks < requiredBlocks)
+        {
+            throw new ArgumentOutOfRangeException(nameof(nBlocks), $"At least {requiredBlocks} blocks are required for {nVectors} vectors.");
+        }
+    }
+
+    internal static (float[] Scores, int[] Indices) ScoreBlockedQuery(
+        ReadOnlySpan<float> query,
+        ReadOnlySpan<byte> blockedCodes,
+        ReadOnlySpan<float> centroids,
+        ReadOnlySpan<float> vecScales,
+        int bitWidth,
+        int nByteGroups,
+        int nVectors,
+        int nBlocks,
+        int k,
+        ReadOnlySpan<ulong> mask,
+        float biasCorrection,
+        bool vectorMajor,
+        bool arm2BitPermuteDot = false)
+    {
+        if (arm2BitPermuteDot)
+        {
+            return Score2BitPermuteDot(query, blockedCodes, centroids, vecScales, nByteGroups,
+                nVectors, nBlocks, k, mask, biasCorrection);
         }
 
-        return (allScores, allIndices);
+        if (vectorMajor && bitWidth == 4)
+        {
+            return ScorePermuteDot(query, blockedCodes, centroids, vecScales, nByteGroups,
+                nVectors, nBlocks, k, mask, biasCorrection);
+        }
+
+        var lutSize = checked(nByteGroups * 32);
+        var lut = ArrayPool<byte>.Shared.Rent(lutSize);
+        try
+        {
+            var (scale, bias) = bitWidth switch
+            {
+                2 => BuildLut2BitInto(query, centroids, lut.AsSpan(0, lutSize)),
+                3 => BuildLut3BitInto(query, centroids, lut.AsSpan(0, lutSize)),
+                4 => BuildLut4BitInto(query, centroids, lut.AsSpan(0, lutSize)),
+                _ => throw new NotSupportedException("Only 2-bit, 3-bit, and 4-bit search are supported."),
+            };
+            bias += biasCorrection;
+            return ScoreNibble(blockedCodes, lut, scale, bias, vecScales, nByteGroups,
+                nVectors, nBlocks, k, mask, vectorMajor);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(lut);
+        }
     }
 
     private static void FillRotatedQueries(ReadOnlySpan<float> queries, int nq, int dim, ReadOnlySpan<float> rotation, Span<float> dest)
@@ -826,291 +782,185 @@ public static class Search
         return bitWidth switch
         {
             2 => dim / 4,
-            3 => dim / 4,
+            3 => dim / 2,
             4 => dim / 2,
             _ => throw new NotSupportedException("Only 2-bit, 3-bit, and 4-bit search are supported."),
         };
     }
 
     private static (float Scale, float Bias) BuildLut4BitInto(ReadOnlySpan<float> qRot, ReadOnlySpan<float> centroids, Span<byte> lut)
-    {
-        int nByteGroups = qRot.Length / 2;
+        => BuildSingleCodeLutInto(qRot, centroids, lut);
 
-        // Compute all products once, tracking min/max simultaneously, to avoid
-        // iterating over centroids twice (each product is q*centroid).
-        float[] products = ArrayPool<float>.Shared.Rent(nByteGroups * 32);
-        float min = float.PositiveInfinity;
-        float max = float.NegativeInfinity;
-        float scale = 0f;
+    private static (float Scale, float Bias) BuildLut3BitInto(ReadOnlySpan<float> qRot, ReadOnlySpan<float> centroids, Span<byte> lut)
+        => BuildSingleCodeLutInto(qRot, centroids, lut);
+
+    private static (float Scale, float Bias) BuildSingleCodeLutInto(ReadOnlySpan<float> qRot, ReadOnlySpan<float> centroids, Span<byte> lut)
+    {
+        var levels = centroids.Length;
+        var products = ArrayPool<float>.Shared.Rent(checked(qRot.Length * levels));
+        var minima = ArrayPool<float>.Shared.Rent(qRot.Length);
+        var maxSpan = 0f;
+        var bias = 0f;
         try
         {
-            for (int g = 0; g < nByteGroups; g++)
+            for (var group = 0; group < qRot.Length / 2; group++)
             {
-                float q0 = qRot[g * 2];
-                float q1 = qRot[(g * 2) + 1];
-                int offset = g * 32;
-                for (int c = 0; c < 16; c++)
+                for (var half = 0; half < 2; half++)
                 {
-                    float v0 = q0 * centroids[c];
-                    float v1 = q1 * centroids[c];
-                    products[offset + c] = v0;
-                    products[offset + 16 + c] = v1;
-                    if (v0 < min) min = v0;
-                    if (v0 > max) max = v0;
-                    if (v1 < min) min = v1;
-                    if (v1 > max) max = v1;
+                    var dim = group * 2 + half;
+                    var min = float.MaxValue;
+                    var max = float.MinValue;
+                    for (var code = 0; code < levels; code++)
+                    {
+                        var value = 0f + qRot[dim] * centroids[code];
+                        products[dim * levels + code] = value;
+                        if (value < min) min = value;
+                        if (value > max) max = value;
+                    }
+
+                    minima[dim] = min;
+                    var span = max - min;
+                    if (span > maxSpan) maxSpan = span;
+                }
+
+                bias += minima[group * 2] + minima[group * 2 + 1];
+            }
+
+            var scale = QuantizationScale(maxSpan);
+            var inverseScale = 1f / scale;
+            for (var dim = 0; dim < qRot.Length; dim++)
+            {
+                for (var code = 0; code < levels; code++)
+                {
+                    var offset = dim * levels + code;
+                    var value = QuantizeToByte(products[offset], minima[dim], inverseScale);
+                    lut[dim * 16 + code] = value;
+                    if (levels == 8) lut[dim * 16 + 8 + code] = value;
                 }
             }
 
-            scale = QuantizationScale(min, max);
-            for (int i = 0; i < nByteGroups * 32; i++)
-            {
-                lut[i] = QuantizeToByte(products[i], min, scale);
-            }
+            return (scale, bias);
         }
         finally
         {
             ArrayPool<float>.Shared.Return(products);
+            ArrayPool<float>.Shared.Return(minima);
         }
-
-        return (scale, min * qRot.Length);
     }
 
     private static (float Scale, float Bias) BuildLut2BitInto(ReadOnlySpan<float> qRot, ReadOnlySpan<float> centroids, Span<byte> lut)
     {
-        int nByteGroups = qRot.Length / 4;
-
-        // Compute all products once, tracking min/max simultaneously.
-        float[] products = ArrayPool<float>.Shared.Rent(nByteGroups * 16);
-        float min = float.PositiveInfinity;
-        float max = float.NegativeInfinity;
-        float scale = 0f;
+        var groups = qRot.Length / 4;
+        var products = ArrayPool<float>.Shared.Rent(checked(groups * 32));
+        var minima = ArrayPool<float>.Shared.Rent(groups * 2);
+        Span<float> first = stackalloc float[4];
+        Span<float> second = stackalloc float[4];
+        var maxSpan = 0f;
+        var bias = 0f;
         try
         {
-            for (int g = 0; g < nByteGroups; g++)
+            for (var group = 0; group < groups; group++)
             {
-                int dimOffset = g * 4;
-                int offset = g * 16;
-                for (int pos = 0; pos < 4; pos++)
+                for (var half = 0; half < 2; half++)
                 {
-                    float q = qRot[dimOffset + pos];
-                    for (int c = 0; c < 4; c++)
+                    var dim = group * 4 + half * 2;
+                    for (var code = 0; code < 4; code++)
                     {
-                        float v = q * centroids[c];
-                        products[offset + (pos * 4) + c] = v;
-                        if (v < min) min = v;
-                        if (v > max) max = v;
+                        first[code] = 0f + qRot[dim] * centroids[code];
+                        second[code] = qRot[dim + 1] * centroids[code];
                     }
+
+                    var minFirst = first[0];
+                    var maxFirst = first[0];
+                    var minSecond = second[0];
+                    var maxSecond = second[0];
+                    for (var code = 1; code < 4; code++)
+                    {
+                        if (first[code] < minFirst) minFirst = first[code];
+                        if (first[code] > maxFirst) maxFirst = first[code];
+                        if (second[code] < minSecond) minSecond = second[code];
+                        if (second[code] > maxSecond) maxSecond = second[code];
+                    }
+
+                    var offset = group * 32 + half * 16;
+                    for (var a = 0; a < 4; a++)
+                    {
+                        for (var b = 0; b < 4; b++)
+                        {
+                            products[offset + a * 4 + b] = first[a] + second[b];
+                        }
+                    }
+
+                    var min = minFirst + minSecond;
+                    minima[group * 2 + half] = min;
+                    var span = (maxFirst + maxSecond) - min;
+                    if (span > maxSpan) maxSpan = span;
                 }
+
+                bias += minima[group * 2] + minima[group * 2 + 1];
             }
 
-            scale = QuantizationScale(min, max);
-            for (int i = 0; i < nByteGroups * 16; i++)
+            var scale = QuantizationScale(maxSpan);
+            var inverseScale = 1f / scale;
+            for (var table = 0; table < groups * 2; table++)
             {
-                lut[i] = QuantizeToByte(products[i], min, scale);
-            }
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(products);
-        }
-
-        return (scale, min * qRot.Length);
-    }
-
-    private static (float Scale, float Bias) BuildLut3BitInto(ReadOnlySpan<float> qRot, ReadOnlySpan<float> centroids, Span<byte> lut)
-    {
-        // Compute all products once, tracking min/max simultaneously.
-        float[] products = ArrayPool<float>.Shared.Rent(qRot.Length * 8);
-        float min = float.PositiveInfinity;
-        float max = float.NegativeInfinity;
-        float scale = 0f;
-        try
-        {
-            for (int dimIdx = 0; dimIdx < qRot.Length; dimIdx++)
-            {
-                float q = qRot[dimIdx];
-                int offset = dimIdx * 8;
-                for (int c = 0; c < 8; c++)
+                for (var code = 0; code < 16; code++)
                 {
-                    float v = q * centroids[c];
-                    products[offset + c] = v;
-                    if (v < min) min = v;
-                    if (v > max) max = v;
+                    var offset = table * 16 + code;
+                    lut[offset] = QuantizeToByte(products[offset], minima[table], inverseScale);
                 }
             }
 
-            scale = QuantizationScale(min, max);
-            for (int i = 0; i < qRot.Length * 8; i++)
-            {
-                lut[i] = QuantizeToByte(products[i], min, scale);
-            }
+            return (scale, bias);
         }
         finally
         {
             ArrayPool<float>.Shared.Return(products);
+            ArrayPool<float>.Shared.Return(minima);
         }
-
-        return (scale, min * qRot.Length);
     }
 
-    private static (float[] Scores, int[] Indices) Score4Bit(
+    private static (float[] Scores, int[] Indices) ScoreNibble(
         ReadOnlySpan<byte> blockedCodes,
         byte[] lut,
         float scale,
         float bias,
         ReadOnlySpan<float> vecScales,
-        int dim,
+        int nByteGroups,
         int nVectors,
         int nBlocks,
         int k,
-        ReadOnlySpan<ulong> mask)
+        ReadOnlySpan<ulong> mask,
+        bool vectorMajor)
     {
-        int nByteGroups = dim / 2;
-        float[] heapScores = CreateScoreBuffer(k);
-        int[] heapIndices = CreateIndexBuffer(k);
-        int heapSize = 0;
-        long localSkipped = 0;
-
-        for (int blockIdx = 0; blockIdx < nBlocks; blockIdx++)
+        if (Avx2.IsSupported && Fma.IsSupported)
         {
-            int baseVec = blockIdx * Constants.Block;
-            if (!BlockHasAllowed(mask, baseVec, nVectors))
-            {
-                localSkipped++;
-                continue;
-            }
-
-            int blockOffset = blockIdx * nByteGroups * Constants.Block;
-            for (int lane = 0; lane < Constants.Block; lane++)
-            {
-                int vecIdx = baseVec + lane;
-                if (vecIdx >= nVectors)
-                {
-                    break;
-                }
-
-                if (!IsAllowed(mask, vecIdx))
-                {
-                    continue;
-                }
-
-                int acc = 0;
-                for (int g = 0; g < nByteGroups; g++)
-                {
-                    byte packed = blockedCodes[blockOffset + (g * Constants.Block) + lane];
-                    acc += lut[(g * 32) + (packed >> 4)];
-                    acc += lut[(g * 32) + 16 + (packed & 0x0F)];
-                }
-
-                float score = (scale * acc) + bias;
-                score *= vecScales[vecIdx];
-                UpdateHeap(heapScores, heapIndices, ref heapSize, k, score, vecIdx);
-            }
+            return ScoreNibbleAvx2(blockedCodes, lut, scale, bias, vecScales, nByteGroups, nVectors, nBlocks, k, mask, vectorMajor);
         }
 
-        FinalizeTopK(heapScores, heapIndices, heapSize);
-        if (localSkipped > 0) Interlocked.Add(ref _blocksSkippedByMask, localSkipped);
-        return (heapScores, heapIndices);
-    }
-
-    private static (float[] Scores, int[] Indices) Score2Bit(
-        ReadOnlySpan<byte> blockedCodes,
-        byte[] lut,
-        float scale,
-        float bias,
-        ReadOnlySpan<float> vecScales,
-        int dim,
-        int nVectors,
-        int nBlocks,
-        int k,
-        ReadOnlySpan<ulong> mask)
-    {
-        int nByteGroups = dim / 4;
-        float[] heapScores = CreateScoreBuffer(k);
-        int[] heapIndices = CreateIndexBuffer(k);
-        int heapSize = 0;
-        long localSkipped = 0;
-
-        for (int blockIdx = 0; blockIdx < nBlocks; blockIdx++)
+        if (AdvSimd.Arm64.IsSupported)
         {
-            int baseVec = blockIdx * Constants.Block;
-            if (!BlockHasAllowed(mask, baseVec, nVectors))
-            {
-                localSkipped++;
-                continue;
-            }
-
-            int blockOffset = blockIdx * nByteGroups * Constants.Block;
-            for (int lane = 0; lane < Constants.Block; lane++)
-            {
-                int vecIdx = baseVec + lane;
-                if (vecIdx >= nVectors)
-                {
-                    break;
-                }
-
-                if (!IsAllowed(mask, vecIdx))
-                {
-                    continue;
-                }
-
-                int acc = 0;
-                for (int g = 0; g < nByteGroups; g++)
-                {
-                    byte packed = blockedCodes[blockOffset + (g * Constants.Block) + lane];
-                    int lutOffset = g * 16;
-                    acc += lut[lutOffset + ((packed >> 6) & 0x03)];
-                    acc += lut[lutOffset + 4 + ((packed >> 4) & 0x03)];
-                    acc += lut[lutOffset + 8 + ((packed >> 2) & 0x03)];
-                    acc += lut[lutOffset + 12 + (packed & 0x03)];
-                }
-
-                float score = (scale * acc) + bias;
-                score *= vecScales[vecIdx];
-                UpdateHeap(heapScores, heapIndices, ref heapSize, k, score, vecIdx);
-            }
+            return ScoreNibbleArm64(blockedCodes, lut, scale, bias, vecScales, nByteGroups, nVectors, nBlocks, k, mask);
         }
 
-        FinalizeTopK(heapScores, heapIndices, heapSize);
-        if (localSkipped > 0) Interlocked.Add(ref _blocksSkippedByMask, localSkipped);
-        return (heapScores, heapIndices);
-    }
+        var heapScores = CreateScoreBuffer(k);
+        var heapIndices = CreateIndexBuffer(k);
+        var heapSize = 0;
+        var localSkipped = 0L;
 
-    private static (float[] Scores, int[] Indices) Score3Bit(
-        ReadOnlySpan<byte> subCodes,
-        ReadOnlySpan<byte> plane2Blocked,
-        byte[] lut,
-        float scale,
-        float bias,
-        ReadOnlySpan<float> vecScales,
-        int dim,
-        int nVectors,
-        int nBlocks,
-        int k,
-        ReadOnlySpan<ulong> mask)
-    {
-        int subByteGroups = dim / 4;
-        int plane2ByteGroups = dim / 8;
-        float[] heapScores = CreateScoreBuffer(k);
-        int[] heapIndices = CreateIndexBuffer(k);
-        int heapSize = 0;
-        long localSkipped = 0;
-
-        for (int blockIdx = 0; blockIdx < nBlocks; blockIdx++)
+        for (var blockIdx = 0; blockIdx < nBlocks; blockIdx++)
         {
-            int baseVec = blockIdx * Constants.Block;
+            var baseVec = blockIdx * Constants.Block;
             if (!BlockHasAllowed(mask, baseVec, nVectors))
             {
                 localSkipped++;
                 continue;
             }
 
-            int subBlockOffset = blockIdx * subByteGroups * Constants.Block;
-            int planeBlockOffset = blockIdx * plane2ByteGroups * Constants.Block;
-            for (int lane = 0; lane < Constants.Block; lane++)
+            var blockOffset = blockIdx * nByteGroups * Constants.Block;
+            for (var lane = 0; lane < Constants.Block; lane++)
             {
-                int vecIdx = baseVec + lane;
+                var vecIdx = baseVec + lane;
                 if (vecIdx >= nVectors)
                 {
                     break;
@@ -1121,31 +971,14 @@ public static class Search
                     continue;
                 }
 
-                int acc = 0;
-                for (int g = 0; g < subByteGroups; g += 2)
+                var score = bias;
+                for (var group = 0; group < nByteGroups; group++)
                 {
-                    byte sub0 = subCodes[subBlockOffset + (g * Constants.Block) + lane];
-                    byte sub1 = subCodes[subBlockOffset + ((g + 1) * Constants.Block) + lane];
-                    byte plane2 = plane2Blocked[planeBlockOffset + ((g >> 1) * Constants.Block) + lane];
-                    int dimBase0 = g * 4;
-                    int dimBase1 = (g + 1) * 4;
-
-                    for (int pos = 0; pos < 4; pos++)
-                    {
-                        int lowBits0 = (sub0 >> ((3 - pos) * 2)) & 0x03;
-                        int highBit0 = (plane2 >> (7 - pos)) & 0x01;
-                        acc += lut[(dimBase0 + pos) * 8 + (lowBits0 | (highBit0 << 2))];
-                    }
-
-                    for (int pos = 0; pos < 4; pos++)
-                    {
-                        int lowBits1 = (sub1 >> ((3 - pos) * 2)) & 0x03;
-                        int highBit1 = (plane2 >> (3 - pos)) & 0x01;
-                        acc += lut[(dimBase1 + pos) * 8 + (lowBits1 | (highBit1 << 2))];
-                    }
+                    var packed = blockedCodes[blockOffset + group * Constants.Block + lane];
+                    score += scale * lut[group * 32 + (packed >> 4)];
+                    score += scale * lut[group * 32 + 16 + (packed & 0x0F)];
                 }
 
-                float score = (scale * acc) + bias;
                 score *= vecScales[vecIdx];
                 UpdateHeap(heapScores, heapIndices, ref heapSize, k, score, vecIdx);
             }
@@ -1388,21 +1221,18 @@ public static class Search
         return highMask & ~lowMask;
     }
 
-    private static byte QuantizeToByte(float value, float min, float scale)
+    private static byte QuantizeToByte(float value, float min, float inverseScale, byte cap = 127)
     {
-        if (scale <= 1e-12f)
-        {
-            return 0;
-        }
-
-        int quantized = (int)MathF.Round((value - min) / scale);
-        return (byte)Math.Clamp(quantized, 0, 255);
+        var quantized = (value - min) * inverseScale;
+        if (!(quantized > 0f)) return 0;
+        if (quantized >= cap) return cap;
+        return (byte)MathF.Round(quantized, MidpointRounding.AwayFromZero);
     }
 
-    private static float QuantizationScale(float min, float max)
+    private static float QuantizationScale(float maxSpan)
     {
-        float range = max - min;
-        return range > 1e-12f ? range / 255.0f : 1.0f;
+        var scale = maxSpan > 0f ? maxSpan / 127f : 1f;
+        return scale >= 1.17549435e-38f ? scale : 1.0f;
     }
 
     private static void ValidateInputs(

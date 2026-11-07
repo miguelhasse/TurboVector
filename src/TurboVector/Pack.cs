@@ -62,6 +62,7 @@ internal static class Pack
         }
 
         var nByteGroups = dim / codesPerByte;
+        var bitsPerCode = bits == 3 ? 4 : bits;
         var nBlocks = (nVectors + Constants.Block - 1) / Constants.Block;
         var blockedSize = checked(nBlocks * nByteGroups * Constants.Block);
         var bytesPerRow = checked(bits * bytesPerPlane);
@@ -107,7 +108,7 @@ internal static class Pack
                             }
                         }
 
-                        byteVal |= (byte)(code << ((codesPerByte - 1 - c) * bits));
+                        byteVal |= (byte)(code << ((codesPerByte - 1 - c) * bitsPerCode));
                     }
 
                     blocked[outOffset + lane] = byteVal;
@@ -197,5 +198,35 @@ internal static class Pack
         }
 
         return (subCodes, plane2Blocked, nBlocks);
+    }
+
+    internal static void Expand3BitBlocked(
+        ReadOnlySpan<byte> subCodes,
+        ReadOnlySpan<byte> plane2Blocked,
+        int dim,
+        int nBlocks,
+        Span<byte> destination)
+    {
+        var groups = dim / 2;
+        var subGroups = dim / 4;
+        var planeGroups = dim / 8;
+        for (var block = 0; block < nBlocks; block++)
+        {
+            for (var group = 0; group < groups; group++)
+            {
+                var subOffset = (block * subGroups + group / 2) * Constants.Block;
+                var planeOffset = (block * planeGroups + group / 4) * Constants.Block;
+                var outputOffset = (block * groups + group) * Constants.Block;
+                var subShift = (1 - (group & 1)) * 4;
+                var planeShift = 6 - (group & 3) * 2;
+                for (var lane = 0; lane < Constants.Block; lane++)
+                {
+                    var low = (subCodes[subOffset + lane] >> subShift) & 15;
+                    var high = (plane2Blocked[planeOffset + lane] >> planeShift) & 3;
+                    destination[outputOffset + lane] = (byte)(((low & 12) << 2) | ((high & 2) << 5)
+                        | (low & 3) | ((high & 1) << 2));
+                }
+            }
+        }
     }
 }

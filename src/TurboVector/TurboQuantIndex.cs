@@ -41,21 +41,13 @@ public sealed class TurboQuantIndex
     {
         public byte[] Data { get; }
         public int NBlocks { get; }
-        public byte[]? SubCodes { get; }
-        public byte[]? Plane2 { get; }
+        public Search.PlanesCache? Planes { get; }
 
-        public BlockedCache(byte[] data, int nBlocks)
+        public BlockedCache(byte[] data, int nBlocks, Search.PlanesCache? planes)
         {
             Data = data;
             NBlocks = nBlocks;
-        }
-
-        public BlockedCache(byte[] subCodes, byte[] plane2, int nBlocks)
-        {
-            Data = [];
-            SubCodes = subCodes;
-            Plane2 = plane2;
-            NBlocks = nBlocks;
+            Planes = planes;
         }
     }
 
@@ -417,46 +409,24 @@ public sealed class TurboQuantIndex
         SearchResults result;
         try
         {
-            if (_bitWidth == 3)
-            {
-                var (scores, indices) = global::TurboVector.Search.Search3Bit_(
-                    queries,
-                    nq,
-                    rotation,
-                    blocked.SubCodes!,
-                    blocked.Plane2!,
-                    centroids,
-                    _scales,
-                    dim,
-                    _nVectors,
-                    blocked.NBlocks,
-                    effectiveK,
-                    rentedMask,
-                    wordCount,
-                    _tqplusShift,
-                    _tqplusScale);
-                result = new SearchResults(scores, indices, nq, effectiveK);
-            }
-            else
-            {
-                var (Scores, Indices) = global::TurboVector.Search.Search_(
-                    queries,
-                    nq,
-                    rotation,
-                    blocked.Data,
-                    centroids,
-                    _scales,
-                    _bitWidth,
-                    dim,
-                    _nVectors,
-                    blocked.NBlocks,
-                    effectiveK,
-                    rentedMask,
-                    wordCount,
-                    _tqplusShift,
-                    _tqplusScale);
-                result = new SearchResults(Scores, Indices, nq, effectiveK);
-            }
+            var (scores, indices) = global::TurboVector.Search.Search_(
+                queries,
+                nq,
+                rotation,
+                blocked.Data,
+                centroids,
+                _scales,
+                _bitWidth,
+                dim,
+                _nVectors,
+                blocked.NBlocks,
+                effectiveK,
+                rentedMask,
+                wordCount,
+                _tqplusShift,
+                _tqplusScale,
+                blocked.Planes);
+            result = new SearchResults(scores, indices, nq, effectiveK);
         }
         finally
         {
@@ -730,16 +700,15 @@ public sealed class TurboQuantIndex
 
     private BlockedCache BuildBlockedCache()
     {
-        int dim = _dim!.Value;
+        var dim = _dim!.Value;
         var codes = new ReadOnlySpan<byte>(_packedCodes, 0, _packedLength);
-        if (_bitWidth == 3)
-        {
-            var (subCodes, plane2, nBlocks) = Pack.Repack3Bit(codes, _nVectors, dim);
-            return new BlockedCache(subCodes, plane2, nBlocks);
-        }
-
-        var (blocked, nBlocksNibble) = Pack.Repack(codes, _nVectors, _bitWidth, dim);
-        return new BlockedCache(blocked, nBlocksNibble);
+        var (blocked, nBlocks) = Pack.Repack(codes, _nVectors, _bitWidth, dim);
+        var groups = dim / (8 / (_bitWidth == 3 ? 4 : _bitWidth));
+        var planes = global::TurboVector.Search.UsePlanes(_bitWidth, groups, _nVectors)
+            ? global::TurboVector.Search.BuildPlanesCache(blocked, _codebook!.Value.Centroids, _tqplusShift, _tqplusScale,
+                _bitWidth, dim, _nVectors, nBlocks)
+            : null;
+        return new BlockedCache(planes is null ? blocked : [], nBlocks, planes);
     }
 
     private static void ValidateBitWidth(int bitWidth)
